@@ -1,0 +1,65 @@
+# --- Rust / Cargo ---
+/target/
+**/*.rs.bk
+*.pdb
+
+# --- Tauri ---
+/src-tauri/target/
+/src-tauri/gen/
+# NOTE: src/bindings.ts is generated but MUST be committed — CI builds in
+# release mode and never runs the debug binary that regenerates it.
+
+# --- Node / frontend ---
+node_modules/
+/dist/
+/build/
+.vite/
+*.tsbuildinfo
+
+# --- Installed agent skills (third-party, managed by `npx skills`) ---
+.agents/
+.claude/
+.skills/
+skills-lock.json
+
+# --- Agent workspace (local working instructions/plans, not project source) ---
+AGENTS.md
+/agent/
+/docs/
+
+# --- Font source (shipped copy lives in public/fonts/) ---
+/Fonts/
+
+# --- Logo source (shipped copies: public/logo.png, src-tauri/icons/) ---
+/Logo/
+
+# --- Session data / analysis output (may contain real AWS log content) ---
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+/cases/
+/sessions/
+/out/
+
+# --- Sample logs: never commit real AWS logs ---
+*.json.gz
+# Masked fixtures are the only exception
+!crates/awslog-core/tests/fixtures/**/*.json.gz
+
+# --- Secrets ---
+.env
+.env.*
+*.pem
+credentials
+
+# --- Test / bench artifacts ---
+/coverage/
+/crates/*/target/
+**/snapshots/*.snap.new
+
+# --- Editor / OS ---
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp

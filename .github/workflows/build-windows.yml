@@ -1,0 +1,142 @@
+name: build-windows
+
+# Local machines run `npm run tauri dev` only. The shipped artifact is the
+# portable Windows .exe produced here (no installer: FR-7 portable execution).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Tag pushes also publish the exe as a GitHub Release asset.
+permissions:
+  contents: write
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Typecheck and build frontend
+        run: npm run build
+
+      - name: Test core
+        run: cargo test -p awslog-core --release
+
+      - name: Build portable exe
+        run: cargo build --release -p awslog-analyzer
+
+      # The exe must not import the VC++ runtime DLLs (.cargo/config.toml
+      # crt-static): a machine with an older redistributable crashes inside
+      # MSVCP140.dll, one without it shows "VCRUNTIME140.dll was not found".
+      - name: Verify no VC++ runtime DLL imports
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vs" }
+          $deps = & $dumpbin.FullName /DEPENDENTS target\release\awslog-analyzer.exe
+          Write-Host ($deps -join "`n")
+          # Every Windows exe imports KERNEL32; its absence means dumpbin did not run.
+          if (-not ($deps -match "KERNEL32\.dll")) { throw "dumpbin produced no import list" }
+          $crt = $deps | Where-Object { $_ -match "MSVCP\d+|VCRUNTIME\d+" }
+          if ($crt) { throw "exe imports the VC++ runtime: $($crt -join ', ')" }
+
+      # An unwritable cases root must fail loudly, never fall back to AppData.
+      - name: Verify unwritable root fails
+        shell: pwsh
+        env:
+          AWSLOG_NO_DIALOG: "1"
+        run: |
+          # Parent must be a *file* so create_dir_all fails regardless of
+          # privilege: the runner is an elevated admin and can write System32.
+          $blocker = Join-Path $env:RUNNER_TEMP "not-a-dir"
+          Set-Content -Path $blocker -Value "x"
+          $target = Join-Path $blocker "cases"
+
+          $out = & "target\release\awslog-analyzer.exe" --cases-dir $target 2>&1
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 1) { throw "expected exit 1 on unwritable root, got $code" }
+          if ($out -notmatch "not writable") { throw "missing diagnostic in stderr" }
+          if ($out -notmatch "AWSLOG_CASES_DIR") { throw "missing remediation hint" }
+          if (Test-Path $target) { throw "case root created despite failure" }
+
+      # FR-7: the app must not write to %LOCALAPPDATA%. Launch it briefly and
+      # assert the WebView2 data went to cases/webview beside the executable.
+      - name: Verify portable output
+        shell: pwsh
+        env:
+          # A startup failure must not block CI on a modal dialog.
+          AWSLOG_NO_DIALOG: "1"
+        run: |
+          $exe = "target\release\awslog-analyzer.exe"
+
+          # Snapshot LOCALAPPDATA before and after the run and diff it.
+          # Matching names like "EBWebView" outright would hit other apps'
+          # WebView2 profiles that already exist on the runner.
+          function Snapshot {
+            Get-ChildItem $env:LOCALAPPDATA -Directory -Recurse -Depth 1 -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty FullName
+          }
+
+          $before = Snapshot
+          $p = Start-Process $exe -PassThru
+          Start-Sleep -Seconds 20
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          $after = Snapshot
+
+          $new = Compare-Object -ReferenceObject $before -DifferenceObject $after |
+            Where-Object SideIndicator -eq "=>" |
+            Select-Object -ExpandProperty InputObject
+          # Only directories this app could have created are a failure.
+          $leaked = $new | Where-Object { $_ -match "awslog|EBWebView" }
+          if ($leaked) { throw "LOCALAPPDATA polluted by this run: $($leaked -join ', ')" }
+          if ($new) { Write-Host "unrelated new dirs (ignored): $($new -join ', ')" }
+
+          if (-not (Test-Path "target\release\cases\app.log")) {
+            throw "cases/app.log missing beside the executable"
+          }
+          Get-Content "target\release\cases\app.log"
+
+          # Positive evidence that data_directory took effect: WebView2 must
+          # have written its profile inside cases/webview.
+          $wv = Get-ChildItem "target\release\cases\webview" -Recurse -File -ErrorAction SilentlyContinue
+          if (-not $wv) { throw "data_directory not applied: cases/webview is empty" }
+          $wv | Select-Object -First 5 FullName
+
+      # The exe is the whole app: the rule pack is compiled in (docs/04) and
+      # everything it writes goes under cases/ beside it (docs/07). It ships
+      # under the project name.
+      - name: Name the shipped exe
+        shell: pwsh
+        run: Copy-Item target\release\awslog-analyzer.exe awslog-analysis.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: awslog-analysis-windows
+          path: awslog-analysis.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: awslog-analysis.exe
+          fail_on_unmatched_files: true
+          generate_release_notes: true

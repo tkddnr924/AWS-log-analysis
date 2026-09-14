@@ -1,0 +1,30 @@
+[package]
+name = "awslog-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `json`: the JSON column type and json_extract_string live in DuckDB's json
+# extension. Linking it in stops DuckDB from downloading it into ~/.duckdb on
+# first use, which fails offline and writes outside cases/ (docs/07).
+duckdb = { version = "1.4.0", features = ["bundled", "json"] }
+flate2 = "1.1.10"
+rayon = "1.12.0"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["parsing", "formatting", "macros"] }
+walkdir = "2.5.0"
+
+[dev-dependencies]
+flate2 = "1.1.10"
+parking_lot = "0.12.5"
+serde_json = "1.0.151"
+tempfile = "3"
+
+# getrusage for the memory-scaling test; unix only.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

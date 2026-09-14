@@ -1,0 +1,10 @@
+# Windows ships as one portable .exe (docs/07). Link the MSVC CRT statically so
+# it carries no MSVCP140/VCRUNTIME140 dependency: a machine whose VC++
+# redistributable is older than the build toolset crashes inside MSVCP140.dll
+# (access violation in std::mutex), and one without it does not start at all.
+# DuckDB's bundled C++ follows through the cc crate (/MT).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

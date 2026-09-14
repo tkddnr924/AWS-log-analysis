@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/awslog-core", "src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+# Dependency debuginfo dominated target/ (DuckDB's bundled C++ alone was
+# ~3 GB per build). We never step into deps; our own crates keep symbols.
+#
+# Dependencies are also optimized in dev: the parser's CPU time is almost
+# entirely gzip inflate (miniz_oxide), JSON (serde_json) and DuckDB, and at
+# opt-level 0 a `cargo tauri dev` parse ran ~6x slower than release (a 3 GB
+# corpus took 1h52m). One slow rebuild of DuckDB buys representative dev runs.
+[profile.dev.package."*"]
+debug = 0
+opt-level = 3
+
+# The parser is CPU-heavy (gzip, tokenization, JSON serialization); keep our
+# small core crate optimized too while the Tauri crate stays debuggable.
+[profile.dev.package.awslog-core]
+opt-level = 2

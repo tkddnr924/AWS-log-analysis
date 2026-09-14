@@ -1,0 +1,2593 @@
+/* Bundled app font; loaded from public/fonts, no external requests (NFR-1). */
+@font-face {
+  font-family: "JayeonSans";
+  src: url("/fonts/JayeonSans-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JayeonSans";
+  src: url("/fonts/JayeonSans-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --font-ui: "JayeonSans", system-ui, sans-serif;
+  /* Paths, ids and timestamps need fixed advance width; JayeonSans is proportional. */
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --bg: #0f1115;
+  --surface: #161920;
+  --surface-2: #1d212a;
+  --line: #2f3542;
+  --text: #e6e9ef;
+  --muted: #b6bfd0;
+  --accent: #4f9cf9;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+
+  /* Glassmorphism, mapped onto the existing dark palette rather than the
+     skill's light tokens: translucent fill, luminous hairline, soft blur. */
+  --glass: rgba(255, 255, 255, 0.07);
+  --glass-strong: rgba(255, 255, 255, 0.11);
+  --glass-line: rgba(255, 255, 255, 0.1);
+  --glass-edge:
+    0 12px 32px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  --glass-blur: blur(16px) saturate(140%);
+  --button-glass: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.135),
+    rgba(255, 255, 255, 0.055)
+  );
+  --button-glass-hover: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.19),
+    rgba(255, 255, 255, 0.075)
+  );
+  --button-line: rgba(222, 232, 247, 0.18);
+  --button-shadow:
+    0 8px 18px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.24),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.2);
+
+  --radius: 8px;
+  --gap: 16px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 16px;
+  color: var(--text);
+  /* Colour first, then the washes. The `background` shorthand used to sit
+     after `background-image` here and silently cleared it, which left every
+     glass layer sitting on flat black with nothing to refract. */
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(
+      900px 640px at 30% 20%,
+      rgba(79, 156, 249, 0.19),
+      transparent 68%
+    ),
+    radial-gradient(
+      760px 560px at 75% 80%,
+      rgba(126, 94, 224, 0.17),
+      transparent 68%
+    ),
+    radial-gradient(
+      700px 420px at 50% 62%,
+      rgba(90, 140, 235, 0.14),
+      transparent 66%
+    );
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+pre {
+  font-family: var(--font-mono);
+}
+
+/* --- controls --- */
+button {
+  position: relative;
+  isolation: isolate;
+  font-family: var(--font-ui);
+  font-size: 15px;
+  padding: 7px 14px;
+  border: 1px solid var(--button-line);
+  border-radius: 8px;
+  background: var(--button-glass);
+  color: var(--text);
+  box-shadow: var(--button-shadow);
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(12px) saturate(155%);
+  -webkit-backdrop-filter: blur(12px) saturate(155%);
+  cursor: pointer;
+  transition:
+    transform 0.14s ease,
+    border-color 0.14s ease,
+    background 0.14s ease,
+    box-shadow 0.14s ease;
+}
+
+button:focus-visible,
+input:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:where(:hover:not(:disabled)) {
+  transform: translateY(-1px);
+  border-color: rgba(129, 190, 255, 0.62);
+  background: var(--button-glass-hover);
+  box-shadow:
+    0 11px 24px rgba(0, 0, 0, 0.3),
+    0 0 0 1px rgba(92, 169, 255, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.18);
+}
+
+button:where(:active:not(:disabled)) {
+  transform: translateY(0);
+  box-shadow:
+    0 4px 10px rgba(0, 0, 0, 0.24),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 1px 4px rgba(0, 0, 0, 0.18);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.primary {
+  border-color: rgba(111, 184, 255, 0.55);
+  background: linear-gradient(
+    180deg,
+    rgba(105, 181, 255, 0.72),
+    rgba(45, 123, 220, 0.52)
+  );
+  color: #f7fbff;
+  box-shadow:
+    0 10px 24px rgba(17, 83, 169, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.38),
+    inset 0 -1px 0 rgba(0, 40, 105, 0.28);
+  font-weight: 500;
+}
+
+button.primary:hover:not(:disabled) {
+  border-color: rgba(158, 210, 255, 0.78);
+  background: linear-gradient(
+    180deg,
+    rgba(126, 194, 255, 0.82),
+    rgba(54, 133, 230, 0.61)
+  );
+}
+
+/* --- app shell --- */
+/* No chrome bar: each screen owns its own header, so the whole window is
+   working area. */
+.shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.grow {
+  flex: 1;
+}
+
+.linklike {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  box-shadow: none;
+  text-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  font-size: 14px;
+}
+
+.linklike:hover:not(:disabled),
+.linklike:active:not(:disabled) {
+  transform: none;
+  background: none;
+  box-shadow: none;
+}
+
+/* Docked bottom-right: out of the reading path, still reachable from every
+   screen while a parse runs. */
+.work-dock {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 16px;
+  border: 1px solid var(--glass-line);
+  border-radius: 999px;
+  background: var(--glass);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  font-size: 14px;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+.work-dock button:not(.linklike) {
+  padding: 3px 10px;
+  font-size: 13px;
+}
+
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 20px;
+  background: rgba(248, 81, 73, 0.1);
+  border-bottom: 1px solid rgba(248, 81, 73, 0.3);
+  color: var(--danger);
+  font-size: 15px;
+  flex: none;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+.notice .linklike {
+  margin-left: auto;
+  color: var(--danger);
+}
+
+.panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 24px 28px 40px;
+}
+
+.boundary {
+  max-width: 640px;
+}
+
+/* Numbered steps make the order explicit: pick, review, parse. */
+.step {
+  margin-bottom: 26px;
+}
+
+.step h1 {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 16px;
+  font-weight: 500;
+  margin: 0 0 10px;
+  color: var(--text);
+}
+
+.step h1 button {
+  font-size: 13px;
+  padding: 3px 10px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  margin: 0;
+}
+
+.case-ref {
+  margin: 0 0 20px;
+  font-size: 15px;
+  color: var(--muted);
+}
+
+.case-ref code {
+  color: var(--accent);
+  font-size: 15px;
+}
+
+/* The run's numbers are the content of this screen, so they are set at
+   display size instead of being squeezed into a sentence. */
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 24px;
+}
+
+.stat {
+  flex: 0 0 auto;
+  min-width: 148px;
+  padding: 12px 16px;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+.stat dt {
+  font-size: 14px;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+
+.stat dd {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.stat-unit {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 3px;
+}
+
+/* Colour marks the two outcomes worth acting on, nothing else. */
+.t-warn dd {
+  color: var(--warn);
+}
+
+.t-danger dd {
+  color: var(--danger);
+}
+
+/* Determinate: the total counts only the selected files. */
+.bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-2);
+  overflow: hidden;
+  margin: 0 0 12px;
+  max-width: 520px;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+.progress-line {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin: 0 0 8px;
+  font-size: 15px;
+  color: var(--muted);
+}
+
+.progress-line strong {
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The parse screen: one centered card instead of a strip in the corner.
+   The numbers are the whole point of the screen, so they are large. */
+.parse-card {
+  width: min(720px, 100%);
+  margin: clamp(24px, 12vh, 96px) auto 0;
+  padding: 28px 32px 24px;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  box-shadow: var(--glass-edge);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.parse-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.parse-head h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.parse-pct {
+  margin-left: auto;
+  color: var(--accent);
+  font-size: 34px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.parse-bar {
+  max-width: none;
+  height: 10px;
+  border-radius: 5px;
+  margin-bottom: 22px;
+}
+
+.parse-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0 0 22px;
+}
+
+.parse-stats > div {
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  background: rgba(10, 14, 21, 0.3);
+}
+
+.parse-stats dt {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.parse-stats dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.parse-stats strong {
+  color: var(--text);
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.parse-stats small {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.parse-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: 0;
+}
+
+/* Inside a glass pane, so no film or blur of its own: stacking a second
+   0.07 film lifted the backdrop and left this the only text at 4.5:1. */
+.match-head {
+  margin: 0;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--glass-line);
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.match-head strong {
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Landing: one column, centered, with the three-step summary so the tool
+   explains itself before anything is loaded. */
+/* Optically centred: with only a hero and a short list, top-anchoring left
+   the bottom third of the window empty. */
+/* The hero sits at a fixed offset instead of being centred with the case
+   list: centring the pair moved the logo and the button up or down depending
+   on how many cases existed. The list now grows downward from a fixed hero. */
+.landing {
+  max-width: 760px;
+  min-height: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  padding-top: 22vh;
+  padding-bottom: 6vh;
+}
+
+.hero {
+  text-align: center;
+  position: relative;
+}
+
+.hero-logo {
+  position: relative;
+}
+
+.hero h1 {
+  position: relative;
+  font-size: 26px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  margin: 18px 0 6px;
+}
+
+.hero-sub {
+  position: relative;
+  color: var(--muted);
+  font-size: 15px;
+  margin: 0 0 24px;
+}
+
+.hero-cta {
+  position: relative;
+  font-size: 16px;
+  padding: 10px 22px;
+  border-radius: 8px;
+}
+
+.landing .cases {
+  margin-top: 44px;
+}
+
+/* --- review step --- */
+/* Path, re-pick and the parse action on one line, always in the same place. */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  margin-bottom: 14px;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+.toolbar-path {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.small {
+  font-size: 14px;
+}
+
+.pick-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.pick-head h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.pick-head strong {
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-tabs {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 3px;
+  padding: 3px;
+  margin-bottom: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 10px;
+  background: rgba(10, 14, 21, 0.38);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 7px 20px rgba(0, 0, 0, 0.18);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
+}
+
+.log-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  padding: 5px 10px;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: #8290a6;
+  text-shadow: none;
+  transform: none;
+}
+
+.log-tabs button:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.055);
+  color: #c8d2e1;
+  box-shadow: none;
+  transform: none;
+}
+
+.log-tabs button.active {
+  border-color: rgba(110, 183, 255, 0.38);
+  background: linear-gradient(
+    180deg,
+    rgba(95, 170, 247, 0.24),
+    rgba(57, 109, 181, 0.12)
+  );
+  color: #d9ecff;
+  box-shadow:
+    0 5px 13px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.19);
+}
+
+.log-tabs button > span {
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #9aabc2;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.log-tabs button.active > span {
+  background: rgba(96, 174, 255, 0.18);
+  color: #bdddff;
+}
+
+.log-support-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 10px;
+  padding: 8px 11px;
+  border: 1px solid rgba(210, 153, 34, 0.24);
+  border-radius: 7px;
+  background: linear-gradient(
+    90deg,
+    rgba(210, 153, 34, 0.1),
+    rgba(210, 153, 34, 0.025)
+  );
+  color: #8290a6;
+  font-size: 13px;
+}
+
+.log-support-note strong {
+  color: #e3b75c;
+  font-weight: 500;
+}
+
+.log-support-note.supported {
+  border-color: rgba(75, 170, 132, 0.25);
+  background: linear-gradient(
+    90deg,
+    rgba(75, 170, 132, 0.1),
+    rgba(75, 170, 132, 0.025)
+  );
+}
+
+.log-support-note.supported strong {
+  color: #75d5a8;
+}
+
+.empty-tab {
+  display: grid;
+  min-height: 74px;
+  place-items: center;
+  margin: 0 0 18px;
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  color: #738198;
+  font-size: 14px;
+}
+
+/* A bounded grid keeps large exports usable; rows after the third stay in
+   the same panel and scroll instead of pushing the sample and case list away. */
+.file-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-auto-rows: 44px;
+  gap: 8px;
+  max-height: 148px;
+  margin-bottom: 18px;
+  padding-right: 4px;
+  overflow-y: auto;
+  align-content: start;
+  scrollbar-gutter: stable;
+}
+
+.file-card {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--glass-line);
+  border-radius: 6px;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.085),
+    rgba(255, 255, 255, 0.035)
+  );
+  cursor: pointer;
+  contain: layout paint style;
+  content-visibility: auto;
+  contain-intrinsic-block-size: 44px;
+  box-shadow:
+    0 5px 14px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.file-card:hover {
+  border-color: var(--muted);
+}
+
+.file-card.on {
+  border-color: rgba(79, 156, 249, 0.55);
+  background: rgba(79, 156, 249, 0.07);
+}
+
+.file-card.unsupported {
+  cursor: default;
+}
+
+.file-card.unsupported:hover {
+  border-color: var(--glass-line);
+}
+
+.file-card input {
+  flex: none;
+  accent-color: var(--accent);
+}
+
+.file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-kind {
+  flex: none;
+  padding: 2px 6px;
+  border: 1px solid rgba(126, 148, 180, 0.2);
+  border-radius: 999px;
+  background: rgba(126, 148, 180, 0.08);
+  color: #9aa8bc;
+  font-size: 11px;
+}
+
+.file-kind.kind-cloudtrail {
+  border-color: rgba(79, 156, 249, 0.28);
+  background: rgba(79, 156, 249, 0.1);
+  color: #9bc9ff;
+}
+
+.file-kind.kind-alb_access {
+  border-color: rgba(210, 153, 34, 0.3);
+  background: rgba(210, 153, 34, 0.1);
+  color: #e3b75c;
+}
+
+.file-meta {
+  flex: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Unreadable or non-AWS input: dimmed but never hidden, so the exclusion is
+   visible rather than silent. */
+.file-card.unknown .file-name,
+.file-card.unknown .file-meta {
+  color: var(--muted);
+}
+
+.file-card.unknown .file-meta {
+  color: var(--warn);
+}
+
+/* --- sample record --- */
+.sample-panel {
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  padding: 12px 14px;
+  margin-bottom: 18px;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+.sample-panel > header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+
+.sample-panel h2 {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 14px;
+}
+
+.alb-sample dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.alb-sample dl > div {
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.alb-sample dt {
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.alb-sample dd {
+  overflow: hidden;
+  margin: 0;
+  color: #d4dce8;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alb-sample p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* --- field mapping --- */
+.mapping > header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.mapping > header .linklike {
+  font-size: 15px;
+}
+
+/* Collapsed: what resolved, at a glance. */
+/* Grouped read-only view: sections down the page, label/value pairs inside.
+   Long payloads get the full width instead of a truncated column. */
+.map-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.map-group h3 {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--muted);
+  margin: 0 0 7px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.map-group dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+  margin: 0;
+}
+
+.map-group dl > div {
+  display: grid;
+  grid-template-columns: 13ch minmax(0, 1fr);
+  gap: 16px;
+  align-items: baseline;
+  min-width: 0;
+  padding: 4px 6px;
+  border-radius: 3px;
+}
+
+/* One line for the fields this record has nothing in, so they cost a line
+   instead of a row each. */
+.map-empty {
+  margin: 4px 0 0 6px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+/* Alternating tint instead of rules: keeps a long wrapped value tied to its
+   label without adding another border to the card. */
+.map-group dl > div:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.016);
+}
+
+/* The label is part of the evidence, not a caption: only one step quieter
+   than the value it names. */
+.map-group dt {
+  color: #cfd6e4;
+  font-size: 15px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.map-group dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.map-group dd .map-value {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: normal;
+  word-break: break-all;
+  overflow: visible;
+}
+
+/* One level of the JSON payload, as chips: keys stay scannable and values
+   wrap instead of being cut at the card edge. */
+.kv {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
+.kv li {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--glass-strong);
+}
+
+.kv-key {
+  color: #7fb3f5;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  white-space: nowrap;
+}
+
+/* Wrap rather than truncate: a clipped ARN or object key is unrecoverable
+   without a tooltip, and tooltips are not keyboard reachable. */
+.kv-val {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: #8fd694;
+  word-break: break-all;
+}
+
+.map-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+/* Give the path column room: fallback chains are long. */
+.map-table th:nth-child(2),
+.map-table td:nth-child(2) {
+  width: 34ch;
+}
+
+/* Resolved values can be a full ARN or a JSON blob: clip, keep the rest in
+   the tooltip, and never let it widen the table. */
+.map-table td:nth-child(3) {
+  max-width: 0;
+}
+
+.map-table th,
+.map-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+.map-table th {
+  background: var(--surface-2);
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 13px;
+}
+
+.map-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.map-table td:first-child {
+  width: 1%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+/* The column name is the contract with the rules, so it stays visible. */
+.map-col {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.map-input {
+  width: 100%;
+  min-width: 30ch;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 4px 8px;
+}
+
+.map-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+
+/* A field with no value is normal for optional keys, so it is dimmed rather
+   than flagged as an error. */
+.unmapped .map-name,
+.map-miss {
+  color: var(--muted);
+}
+
+.map-miss {
+  font-size: 13px;
+}
+
+/* --- past cases --- */
+.cases {
+  margin-top: 28px;
+  text-align: left;
+}
+
+.cases h2 {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+  margin: 0 0 8px;
+  padding-left: 2px;
+}
+
+.cases ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+/* Same height in both states, so opening the prompt never shifts the list. */
+/* One column set for the whole list: id+path, status, count, actions. Every
+   cell is a direct child, so no row can resolve widths of its own. */
+.case-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px 11ch 116px;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 14px 12px 16px;
+  min-height: 62px;
+}
+
+/* Confirming swaps two cells for one spanning both, so the template and
+   every other column stay exactly where they were. */
+.confirming .case-main code {
+  color: var(--danger);
+}
+
+.case-warning {
+  grid-column: 2 / 4;
+  font-size: 14px;
+  color: var(--danger);
+  white-space: nowrap;
+}
+
+.case-row + .case-row {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.case-row:not(.confirming):hover {
+  background: var(--glass-strong);
+}
+
+.case-main {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Grid, not flex: the badge column is fixed so the count starts at the same
+   x whatever the status word is. */
+.case-main code {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.case-dir {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.case-status {
+  justify-self: start;
+  text-align: center;
+  font-size: 13px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.s-done {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--ok);
+}
+
+.s-cancelled {
+  background: rgba(210, 153, 34, 0.15);
+  color: var(--warn);
+}
+
+.s-failed {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--danger);
+}
+
+.case-count {
+  color: var(--muted);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.case-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.case-actions button {
+  min-width: 52px;
+  font-size: 13px;
+  padding: 4px 10px;
+  text-align: center;
+}
+
+.case-open-btn {
+  border-color: rgba(79, 156, 249, 0.45);
+  color: var(--accent);
+}
+
+.case-del {
+  border-color: rgba(182, 191, 208, 0.14);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.07),
+    rgba(255, 255, 255, 0.025)
+  );
+  color: var(--muted);
+}
+
+.case-del:hover:not(:disabled) {
+  border-color: rgba(248, 81, 73, 0.5);
+  background: linear-gradient(
+    180deg,
+    rgba(248, 81, 73, 0.18),
+    rgba(248, 81, 73, 0.08)
+  );
+  color: var(--danger);
+}
+
+.confirming {
+  background: rgba(248, 81, 73, 0.1);
+}
+
+.confirming button:not(.danger) {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.11),
+    rgba(255, 255, 255, 0.045)
+  );
+}
+
+.confirming .danger {
+  border-color: rgba(255, 121, 115, 0.72);
+  background: linear-gradient(
+    180deg,
+    rgba(248, 105, 98, 0.72),
+    rgba(194, 49, 44, 0.55)
+  );
+  color: #fff4f3;
+  box-shadow:
+    0 8px 18px rgba(111, 19, 16, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  font-weight: 500;
+}
+
+/* --- results window --- */
+.results {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.results > header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 14px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.results > header h1 {
+  font-size: 17px;
+  font-weight: 500;
+  margin: 0;
+}
+
+.results > header code {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.results-body {
+  display: grid;
+  grid-template-columns: minmax(250px, 330px) minmax(0, 1fr);
+  gap: 14px;
+  flex: 1;
+  min-height: 0;
+}
+
+/* The rule pane owns its own header so add/remove sit with the list they
+   act on, not in the page header. */
+.rule-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  overflow: hidden;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+.rule-pane > header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+  padding: 7px 9px 7px 13px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: linear-gradient(
+    180deg,
+    rgba(31, 36, 47, 0.94),
+    rgba(24, 28, 37, 0.9)
+  );
+}
+
+/* Sits above the rule header: the date range is the outer filter and the
+   rules count inside it. */
+.date-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 9px 13px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(10, 14, 21, 0.3);
+}
+
+.date-filter label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #8290a6;
+  font-size: 12px;
+}
+
+.date-filter input[type="text"] {
+  width: 180px;
+  padding: 4px 7px;
+  border: 1px solid rgba(125, 148, 180, 0.18);
+  border-radius: 6px;
+  background: rgba(7, 10, 15, 0.46);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.date-filter input::placeholder {
+  color: var(--muted);
+}
+
+.date-filter input.invalid {
+  border-color: rgba(255, 110, 110, 0.55);
+}
+
+.date-filter .linklike {
+  font-size: 12px;
+}
+
+.date-error {
+  flex-basis: 100%;
+  color: #ff8a8a;
+  font-size: 12px;
+}
+
+.date-span {
+  flex-basis: 100%;
+  color: #65738a;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rule-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rule-pane > header h2 {
+  margin: 0;
+  color: #e7edf6;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.1;
+}
+
+.rule-heading > span {
+  color: #65738a;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.rule-total {
+  padding: 3px 6px;
+  border: 1px solid rgba(135, 154, 184, 0.14);
+  border-radius: 999px;
+  background: rgba(135, 154, 184, 0.055);
+  color: #7f8da3;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.add-rule {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 9px;
+  border-color: rgba(88, 166, 255, 0.28);
+  background: rgba(88, 166, 255, 0.09);
+  color: #9bc9ff;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.add-rule > span {
+  font-size: 16px;
+  line-height: 1;
+}
+
+.add-rule:hover:not(:disabled) {
+  border-color: rgba(88, 166, 255, 0.62);
+  background: rgba(88, 166, 255, 0.15);
+}
+
+.rule-list {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 0;
+  margin: 0;
+  padding: 6px;
+  overflow-y: auto;
+  list-style: none;
+  background: linear-gradient(
+    180deg,
+    rgba(13, 17, 24, 0.32),
+    rgba(13, 17, 24, 0.12)
+  );
+}
+
+/* The row, not the select button, carries hover/active styling so the
+   edit/delete icons sit inside the highlighted box rather than beside it. */
+.rule-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 38px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+}
+
+.rule-list .rule-actions {
+  align-self: center;
+  display: grid;
+  grid-auto-flow: column;
+  gap: 4px;
+  padding: 0 8px 0 4px;
+}
+
+/* Icon-only, but not invisible: color and a quiet outline identify edit vs
+   delete before hover; aria-label/title carry the text. */
+.rule-list .rule-actions button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid rgba(182, 191, 208, 0.2);
+  border-radius: 7px;
+  background: rgba(182, 191, 208, 0.05);
+  color: var(--muted);
+}
+
+.rule-list .rule-actions svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.rule-list .rule-actions button.edit {
+  border-color: rgba(79, 156, 249, 0.34);
+  color: #9bc9ff;
+}
+
+.rule-list .rule-actions button.delete {
+  border-color: rgba(248, 81, 73, 0.32);
+  color: #ff9a96;
+}
+
+.rule-list .rule-actions button:hover:not(:disabled) {
+  background: rgba(182, 191, 208, 0.12);
+  filter: brightness(1.15);
+}
+
+.rule-list .rule-actions button.danger {
+  border-color: rgba(248, 81, 73, 0.58);
+  background: rgba(248, 81, 73, 0.18);
+  color: #ffaaa6;
+}
+
+.rule-list .rule-select {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  box-shadow: none;
+  text-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  text-align: left;
+  transform: none;
+}
+
+.rule-list li:hover:not(.active) {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.rule-list li.active {
+  border-color: rgba(88, 166, 255, 0.24);
+  background: linear-gradient(
+    90deg,
+    rgba(79, 156, 249, 0.17),
+    rgba(102, 84, 190, 0.08)
+  );
+  box-shadow:
+    inset 3px 0 0 #58a6ff,
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 5px 16px rgba(0, 0, 0, 0.18);
+}
+
+/* The match pane with nothing to show, or while the selected rule runs. */
+.match-empty,
+.match-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 72px 24px;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+.match-empty svg {
+  color: #4f5d75;
+  margin-bottom: 6px;
+}
+
+.match-empty strong,
+.match-loading strong {
+  color: var(--text);
+  font-size: 17px;
+  font-weight: 500;
+}
+
+.match-loading .rule-spinner {
+  width: 28px;
+  height: 28px;
+  margin: 0 0 6px;
+  border-width: 3px;
+}
+
+/* Evaluation in progress: a spinner where the count will appear. */
+.rule-spinner {
+  width: 12px;
+  height: 12px;
+  margin-right: 4px;
+  border: 2px solid rgba(139, 161, 194, 0.25);
+  border-top-color: #9bc9ff;
+  border-radius: 50%;
+  animation: rule-spin 0.8s linear infinite;
+}
+
+@keyframes rule-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.rule-label {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.rule-marker {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border: 1px solid rgba(139, 161, 194, 0.42);
+  border-radius: 50%;
+  background: #77869d;
+  box-shadow: 0 0 7px rgba(119, 134, 157, 0.28);
+}
+
+.rule-marker.overview {
+  border-radius: 2px;
+  border-color: rgba(88, 166, 255, 0.58);
+  background: #58a6ff;
+  box-shadow: 0 0 8px rgba(88, 166, 255, 0.38);
+}
+
+.rule-marker.severity-high {
+  border-color: rgba(255, 124, 115, 0.6);
+  background: #f87871;
+  box-shadow: 0 0 7px rgba(248, 120, 113, 0.32);
+}
+
+.rule-marker.severity-medium {
+  border-color: rgba(242, 204, 96, 0.58);
+  background: #e8bd55;
+  box-shadow: 0 0 7px rgba(232, 189, 85, 0.28);
+}
+
+.rule-marker.severity-low {
+  border-color: rgba(104, 192, 255, 0.5);
+  background: #68b5ea;
+  box-shadow: 0 0 7px rgba(104, 181, 234, 0.24);
+}
+
+.rule-id {
+  min-width: 0;
+  overflow: hidden;
+  color: #dce4ef;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hits {
+  padding: 2px 6px;
+  border: 1px solid rgba(182, 191, 208, 0.16);
+  border-radius: 999px;
+  background: rgba(182, 191, 208, 0.07);
+  color: #d4dae5;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+/* Not yet run over this case: quieter than a count so it is not read as
+   "zero matches". */
+.hits.pending {
+  border-style: dashed;
+  background: transparent;
+  color: #7f8ca3;
+  font-size: 12px;
+}
+
+.hits.pending.failed {
+  border-color: rgba(255, 110, 110, 0.5);
+  color: #ff8a8a;
+}
+
+.rule-error {
+  margin: 0;
+  padding: 8px 13px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  font-size: 12px;
+}
+
+.match-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--glass-line);
+  border-radius: var(--radius);
+  background: var(--glass);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+/* The head strip is now a toolbar: search, the count of what is on screen,
+   and the time order. Laid out with grid so the count sits between the two
+   controls and does not move as its digits change. */
+.match-pane .match-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 9px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 0;
+  background: linear-gradient(
+    180deg,
+    rgba(30, 35, 47, 0.88),
+    rgba(23, 27, 36, 0.82)
+  );
+  font-size: 14px;
+}
+
+.match-search {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 11px;
+  border: 1px solid rgba(125, 148, 180, 0.18);
+  border-radius: 7px;
+  background: rgba(7, 10, 15, 0.46);
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.18);
+}
+
+.match-search::placeholder {
+  color: var(--muted);
+}
+
+/* Tabular digits: the count changes while paging and a proportional font
+   would shift the controls next to it. */
+.match-count {
+  padding: 4px 8px;
+  border: 1px solid rgba(88, 166, 255, 0.16);
+  border-radius: 999px;
+  background: rgba(88, 166, 255, 0.055);
+  color: #8b9bb2;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.match-count strong {
+  color: #bddaff;
+  font-weight: 650;
+}
+
+.sort-toggle {
+  padding: 5px 9px;
+  border-color: rgba(170, 183, 207, 0.18);
+  background: rgba(255, 255, 255, 0.045);
+  color: #b8c3d4;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+/* No blur here. This is the one region that scrolls thousands of rows, and
+   a backdrop-filter on it would recomposite the whole pane every frame —
+   worse on Windows WebView2 without GPU acceleration. */
+.match-scroll {
+  overflow-y: auto;
+  flex: 1;
+  background: rgba(15, 17, 21, 0.35);
+}
+
+/* Fixed-height rows: the window maths assumes it. Evidence with many
+   variables is clipped rather than allowed to overlap the next row. */
+.match-row {
+  padding: 10px 14px;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.052);
+  box-shadow: inset 2px 0 0 transparent;
+  transition:
+    background 0.12s,
+    box-shadow 0.12s;
+}
+
+/* HTTP rows (ALB, API Gateway, nginx): method / status / URL / client /
+   target / user agent. */
+.match-cols.cols-http,
+.match-main.cols-http {
+  grid-template-columns:
+    minmax(190px, 0.8fr)
+    minmax(72px, 0.3fr)
+    minmax(60px, 0.25fr)
+    minmax(150px, 2fr)
+    minmax(130px, 0.7fr)
+    minmax(110px, 0.6fr)
+    minmax(120px, 1fr);
+}
+
+/* WAF rows: action / method / URL / client / country / rule / user agent. */
+.match-cols.cols-waf,
+.match-main.cols-waf {
+  grid-template-columns:
+    minmax(190px, 0.8fr)
+    minmax(72px, 0.3fr)
+    minmax(72px, 0.3fr)
+    minmax(150px, 2fr)
+    minmax(130px, 0.7fr)
+    minmax(48px, 0.2fr)
+    minmax(140px, 1fr)
+    minmax(120px, 1fr);
+}
+
+.status-badge {
+  justify-self: start;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 8px;
+  border: 1px solid rgba(182, 191, 208, 0.16);
+  border-radius: 5px;
+  background: rgba(182, 191, 208, 0.07);
+  color: #d4dae5;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.status-badge.status-2xx {
+  border-color: rgba(63, 185, 80, 0.3);
+  color: #7ee29a;
+}
+
+.status-badge.status-3xx {
+  border-color: rgba(96, 174, 255, 0.3);
+  color: #9bc9ff;
+}
+
+.status-badge.status-4xx {
+  border-color: rgba(242, 204, 96, 0.35);
+  color: #f0cf6a;
+}
+
+.status-badge.status-5xx {
+  border-color: rgba(248, 81, 73, 0.4);
+  color: #ff9a96;
+}
+
+.region {
+  color: #9aabc2;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.url {
+  min-width: 0;
+  overflow: hidden;
+  color: #c9d3e2;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* One shared column set for the header and every row, so values line up
+   instead of each row packing its own spans. CloudTrail: time / event /
+   service / principal / source / region / error / resource. */
+.match-cols,
+.match-main {
+  display: grid;
+  grid-template-columns:
+    minmax(170px, 0.6fr)
+    minmax(96px, 0.5fr)
+    minmax(52px, 0.25fr)
+    minmax(120px, 1.2fr)
+    minmax(110px, 0.7fr)
+    minmax(96px, 0.4fr)
+    minmax(96px, 0.5fr)
+    minmax(120px, 1.3fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.match-cols {
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--glass-line);
+  background: rgba(11, 14, 20, 0.28);
+  color: #6f7d92;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.match-main {
+  font-size: 14px;
+}
+
+.m-time {
+  color: #8797ad;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.event-badge,
+.service-badge {
+  width: fit-content;
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid;
+  border-radius: 5px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.event-badge {
+  padding: 5px 7px;
+}
+
+.event-read {
+  border-color: rgba(88, 166, 255, 0.22);
+  background: rgba(88, 166, 255, 0.08);
+  color: #8ec7ff;
+}
+
+.event-change {
+  border-color: rgba(198, 156, 255, 0.25);
+  background: rgba(166, 109, 255, 0.09);
+  color: #d2adff;
+}
+
+.event-danger {
+  border-color: rgba(255, 124, 115, 0.26);
+  background: rgba(248, 81, 73, 0.09);
+  color: #ffaaa4;
+}
+
+.event-identity {
+  border-color: rgba(242, 204, 96, 0.25);
+  background: rgba(242, 204, 96, 0.08);
+  color: #f2d47c;
+}
+
+.service-badge {
+  padding: 4px 7px;
+  border-color: rgba(84, 214, 180, 0.2);
+  background: rgba(57, 190, 154, 0.07);
+  color: #7fd7c0;
+  letter-spacing: 0.04em;
+}
+
+.principal,
+.endpoint {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  color: #9ba8ba;
+}
+
+.principal small,
+.endpoint small {
+  flex: none;
+  padding: 3px 5px;
+  border: 1px solid rgba(140, 158, 187, 0.16);
+  border-radius: 4px;
+  background: rgba(140, 158, 187, 0.055);
+  color: #718096;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.principal span,
+.endpoint span {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.endpoint {
+  color: #9aa9bc;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The row is the control: clicking anywhere in it opens the detail view. */
+.match-row[role="button"] {
+  cursor: pointer;
+}
+
+.match-row:hover {
+  background: linear-gradient(
+    90deg,
+    rgba(79, 156, 249, 0.08),
+    rgba(255, 255, 255, 0.035)
+  );
+  box-shadow: inset 2px 0 0 rgba(88, 166, 255, 0.78);
+}
+
+.match-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.raw-json {
+  margin-top: 18px;
+}
+
+.raw-json summary {
+  font-size: 14px;
+}
+
+/* Right-side drawer over a scrim: the previous floating card sat on top of
+   the match list and hid the rows it was opened from. */
+.raw-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(6, 8, 12, 0.55);
+}
+
+.raw {
+  width: min(560px, 46vw);
+  height: 100%;
+  overflow-y: auto;
+  background: var(--glass);
+  border-left: 1px solid var(--line);
+  padding: 16px 18px;
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-edge);
+}
+
+.raw header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.raw h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.raw pre {
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--text);
+  margin: 0;
+}
+
+/* Rule: honour prefers-reduced-motion — every transition here is decorative. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* --- rule editor --- */
+.rule-editor {
+  width: min(1180px, 88vw);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  overflow-y: auto;
+  border-left: 1px solid rgba(79, 156, 249, 0.22);
+  background:
+    radial-gradient(circle at 82% 8%, rgba(116, 91, 218, 0.1), transparent 28%),
+    linear-gradient(145deg, #171b24 0%, #12161e 72%);
+  box-shadow: -24px 0 70px rgba(0, 0, 0, 0.42);
+  padding: 17px 20px;
+}
+
+.rule-editor header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.rule-editor h2 {
+  margin: 0;
+  color: #f3f6fb;
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+/* Source left, feedback right: the explanation and the hit count are only
+   useful while the text is still in view. */
+.editor-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.source-pane {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 360px;
+  overflow: hidden;
+  border: 1px solid rgba(79, 156, 249, 0.24);
+  border-radius: 9px;
+  background: #0d1117;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.035),
+    0 16px 40px rgba(0, 0, 0, 0.2);
+}
+
+.source-pane:focus-within {
+  border-color: rgba(79, 156, 249, 0.65);
+  box-shadow:
+    0 0 0 1px rgba(79, 156, 249, 0.18),
+    0 16px 40px rgba(0, 0, 0, 0.24);
+}
+
+/* Line numbers: parser errors are reported by line. */
+.gutter {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 14px 9px;
+  border-right: 1px solid rgba(79, 156, 249, 0.16);
+  background: rgba(79, 156, 249, 0.035);
+  color: #657188;
+  font-family: var(--font-mono);
+  font-size: 15px;
+  line-height: 1.65;
+  text-align: right;
+  user-select: none;
+}
+
+.code-stack {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The textarea remains the real editor. The pre directly behind it mirrors
+   every character; both layers have identical metrics and scroll offsets. */
+.rule-highlight,
+.rule-source {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 14px 16px;
+  border: 0;
+  font-family: var(--font-mono);
+  font-size: 15px;
+  line-height: 1.65;
+  tab-size: 4;
+  white-space: pre;
+  word-wrap: normal;
+}
+
+.rule-highlight {
+  overflow: hidden;
+  color: #c9d1d9;
+  background: transparent;
+  pointer-events: none;
+}
+
+.rule-source {
+  z-index: 1;
+  resize: none;
+  overflow: auto;
+  background: transparent;
+  color: transparent;
+  caret-color: #f0f6fc;
+  -webkit-text-fill-color: transparent;
+}
+
+.rule-source::selection {
+  background: rgba(79, 156, 249, 0.34);
+}
+
+.rule-source:focus-visible {
+  outline: none;
+}
+
+.syntax-keyword {
+  color: #c69cff;
+  font-weight: 650;
+}
+
+.syntax-field {
+  color: #79c8ff;
+}
+
+.syntax-variable {
+  color: #58a6ff;
+  font-weight: 600;
+}
+
+.syntax-string {
+  color: #8fdaa0;
+}
+
+.syntax-regex {
+  color: #ff9f92;
+}
+
+.syntax-operator {
+  color: #ffbd73;
+  font-weight: 600;
+}
+
+.syntax-literal,
+.syntax-number {
+  color: #f2cc60;
+}
+
+.syntax-comment {
+  color: #68758b;
+  font-style: italic;
+}
+
+.editor-side {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 3px;
+}
+
+/* The sentence the engine would evaluate. */
+.outline {
+  position: relative;
+  overflow: hidden;
+  padding: 13px 15px 14px;
+  border: 1px solid rgba(63, 185, 80, 0.4);
+  border-radius: 9px;
+  background: linear-gradient(
+    135deg,
+    rgba(63, 185, 80, 0.12),
+    rgba(63, 185, 80, 0.045)
+  );
+  box-shadow: inset 3px 0 0 rgba(63, 185, 80, 0.65);
+}
+
+.outline.broken {
+  border-color: rgba(248, 81, 73, 0.44);
+  background: linear-gradient(
+    135deg,
+    rgba(248, 81, 73, 0.13),
+    rgba(248, 81, 73, 0.045)
+  );
+  box-shadow: inset 3px 0 0 rgba(248, 81, 73, 0.72);
+}
+
+.outline h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 7px;
+  color: #a9e9b7;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.outline.broken h3 {
+  color: #ffaaa6;
+}
+
+.outline h3 code {
+  color: #7d8ba4;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.outline p {
+  margin: 0;
+  color: #dce5ef;
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.outline.broken p {
+  color: #ffaaa6;
+  font-family: var(--font-mono);
+}
+
+.variable-fixes {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid rgba(248, 81, 73, 0.2);
+  color: #c9918f;
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+
+.variable-fixes button {
+  padding: 3px 7px;
+  border-color: rgba(88, 166, 255, 0.38);
+  background: rgba(88, 166, 255, 0.1);
+  color: #8cc5ff;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.editor-side > .actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+}
+
+.editor-side > .actions button {
+  border-color: rgba(79, 156, 249, 0.28);
+  background: rgba(79, 156, 249, 0.1);
+  color: #a9d2ff;
+}
+
+.hit-count {
+  color: #8d9ab0;
+  font-size: 13px;
+}
+
+.hit-count strong {
+  color: #e8edf5;
+  font-variant-numeric: tabular-nums;
+}
+
+.variable-tools {
+  padding: 10px;
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  border-left: 2px solid #58a6ff;
+  border-radius: 8px;
+  background: linear-gradient(
+    135deg,
+    rgba(88, 166, 255, 0.075),
+    rgba(88, 166, 255, 0.02)
+  );
+}
+
+.palette-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.palette-heading h4 {
+  margin: 0;
+  color: #8cc5ff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.palette-heading span {
+  color: #77849a;
+  font-size: 11px;
+}
+
+.declared-variables {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.declared-variables button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 7px;
+  border-color: rgba(88, 166, 255, 0.28);
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.declared-variables code {
+  color: #7cbbff;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.declared-variables button span {
+  max-width: 130px;
+  overflow: hidden;
+  color: #7f8ba0;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.variable-empty {
+  margin: 0 0 8px;
+  color: #78859a;
+  font-size: 12px;
+}
+
+.variable-builder {
+  display: grid;
+  grid-template-columns: minmax(78px, 0.75fr) minmax(110px, 1fr) auto;
+  gap: 5px;
+}
+
+.variable-builder label {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  border-radius: 5px;
+  background: rgba(8, 12, 18, 0.48);
+}
+
+.variable-builder label:focus-within {
+  border-color: rgba(88, 166, 255, 0.7);
+}
+
+.variable-builder label > span {
+  padding-left: 7px;
+  color: #58a6ff;
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.variable-builder input,
+.variable-builder select {
+  box-sizing: border-box;
+  min-width: 0;
+  height: 27px;
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  border-radius: 5px;
+  background: rgba(8, 12, 18, 0.78);
+  color: #cbd5e1;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.variable-builder input {
+  width: 100%;
+  padding: 0 6px 0 2px;
+  border: 0;
+  background: transparent;
+}
+
+.variable-builder select {
+  padding: 0 6px;
+}
+
+.variable-builder input:focus,
+.variable-builder select:focus {
+  outline: none;
+  border-color: rgba(88, 166, 255, 0.7);
+}
+
+.variable-builder button {
+  padding: 4px 8px;
+  border-color: rgba(88, 166, 255, 0.38);
+  background: rgba(88, 166, 255, 0.13);
+  color: #9bc9ff;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.variable-help {
+  margin: 7px 0 0;
+  color: #718097;
+  font-size: 11px;
+  line-height: 1.45;
+}
+/* Insertable tokens. Clicking one keeps the caret where it was. */
+.palette {
+  --palette-tone: #9bc9ff;
+  --palette-bg: rgba(79, 156, 249, 0.08);
+  --palette-line: rgba(79, 156, 249, 0.25);
+  padding: 9px 10px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-left: 2px solid var(--palette-tone);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.palette-operator {
+  --palette-tone: #c69cff;
+  --palette-bg: rgba(166, 109, 255, 0.08);
+  --palette-line: rgba(166, 109, 255, 0.24);
+}
+
+.palette-logic {
+  --palette-tone: #ffbd73;
+  --palette-bg: rgba(255, 166, 66, 0.08);
+  --palette-line: rgba(255, 166, 66, 0.24);
+}
+
+.palette-snippet {
+  --palette-tone: #8fdaa0;
+  --palette-bg: rgba(63, 185, 80, 0.075);
+  --palette-line: rgba(63, 185, 80, 0.24);
+}
+
+.palette h4 {
+  margin: 0 0 7px;
+  color: var(--palette-tone);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.palette > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.palette button {
+  padding: 4px 8px;
+  border-color: var(--palette-line);
+  background: var(--palette-bg);
+  color: var(--palette-tone);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.palette button:hover:not(:disabled) {
+  border-color: var(--palette-tone);
+  background: var(--palette-bg);
+  filter: brightness(1.18);
+}
+
+.discard-note {
+  font-size: 14px;
+  color: var(--danger);
+}
+
+.rule-editor .danger {
+  border-color: rgba(255, 121, 115, 0.72);
+  background: linear-gradient(
+    180deg,
+    rgba(248, 105, 98, 0.72),
+    rgba(194, 49, 44, 0.55)
+  );
+  color: #fff4f3;
+  box-shadow:
+    0 8px 18px rgba(111, 19, 16, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  font-weight: 500;
+}
