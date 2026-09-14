@@ -25,6 +25,10 @@ const ALL_EVENTS = "*";
 const BOUND =
   /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])( ([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?)?$/;
 
+/// Prefix of `StoreError::BadDateTime`'s message: a rejected bound is shown
+/// by the inputs, not as a screen-level error.
+const BAD_DATE = "존재하지 않는 날짜·시각입니다";
+
 /// The bound to send: the complete value, or "" while it is empty or still
 /// being typed.
 function boundOf(typed: string): string {
@@ -118,9 +122,15 @@ export function Results({ caseId }: { caseId: string }) {
   // the inputs instead of replacing the screen, so it can be corrected.
   const [filterError, setFilterError] = useState<string | null>(null);
   function fail(message: string) {
-    if (message.startsWith("invalid date/time")) return setFilterError(message);
+    if (message.startsWith(BAD_DATE)) return setFilterError(message);
     setError(message);
   }
+  // Which bound the backend rejected: the message quotes the value. Only
+  // that input turns red; the other one is still a valid filter.
+  const badFrom =
+    !!filterError && from !== "" && filterError.includes(JSON.stringify(from));
+  const badTo =
+    !!filterError && to !== "" && filterError.includes(JSON.stringify(to));
 
   // `reload` re-reads groups and totals; saving or deleting a rule changes
   // them, so it is not a mount-only effect.
@@ -388,48 +398,63 @@ export function Results({ caseId }: { caseId: string }) {
           {/* Above the rules on purpose: the range narrows what the rules
               count, so it reads as the outer filter. */}
           <div className="date-filter" role="group" aria-label="기간 필터">
-            <label>
-              <span>부터</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                placeholder="YYYY-MM-DD HH:MM:SS"
-                value={fromTyped}
-                aria-invalid={isBadBound(fromTyped)}
-                className={isBadBound(fromTyped) ? "invalid" : ""}
-                onChange={(e) => setFromTyped(e.target.value)}
-              />
-            </label>
-            <label>
-              <span>까지</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                placeholder="YYYY-MM-DD HH:MM:SS"
-                value={toTyped}
-                aria-invalid={isBadBound(toTyped)}
-                className={isBadBound(toTyped) ? "invalid" : ""}
-                onChange={(e) => setToTyped(e.target.value)}
-              />
-            </label>
-            <button
-              className="linklike"
-              disabled={!fromTyped && !toTyped}
-              onClick={() => {
-                setFromTyped("");
-                setToTyped("");
-              }}
-            >
-              초기화
-            </button>
-            {page.first_day && page.last_day && (
-              <span className="date-span">
-                {`${page.first_day} ~ ${page.last_day}`}
-              </span>
-            )}
+            {/* One field, two rows: the range is a single value, not two
+                settings. The case's own span is the placeholder, so the
+                format and the data's extent are shown by the same text. */}
+            <div className={`date-range${fromTyped || toTyped ? " set" : ""}`}>
+              <label>
+                <span>부터</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  placeholder={
+                    page.first_day
+                      ? `${page.first_day} 00:00:00`
+                      : "YYYY-MM-DD HH:MM:SS"
+                  }
+                  value={fromTyped}
+                  aria-invalid={isBadBound(fromTyped) || badFrom}
+                  className={isBadBound(fromTyped) || badFrom ? "invalid" : ""}
+                  onChange={(e) => setFromTyped(e.target.value)}
+                />
+              </label>
+              <label>
+                <span>까지</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  placeholder={
+                    page.last_day
+                      ? `${page.last_day} 23:59:59`
+                      : "YYYY-MM-DD HH:MM:SS"
+                  }
+                  value={toTyped}
+                  aria-invalid={isBadBound(toTyped) || badTo}
+                  className={isBadBound(toTyped) || badTo ? "invalid" : ""}
+                  onChange={(e) => setToTyped(e.target.value)}
+                />
+              </label>
+              {(fromTyped || toTyped) && (
+                <button
+                  className="date-clear"
+                  aria-label="기간 초기화"
+                  title="기간 초기화"
+                  onClick={() => {
+                    setFromTyped("");
+                    setToTyped("");
+                  }}
+                >
+                  ×
+                </button>
+              )}
+            </div>
             {filterError && (
               <span className="date-error" role="alert">
-                {filterError}
+                {badFrom && !badTo
+                  ? "없는 날짜입니다 (부터)"
+                  : badTo && !badFrom
+                    ? "없는 날짜입니다 (까지)"
+                    : "없는 날짜입니다"}
               </span>
             )}
           </div>

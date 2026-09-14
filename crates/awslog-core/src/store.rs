@@ -62,9 +62,8 @@ pub enum StoreError {
     CaseJson(#[source] serde_json::Error),
     #[error("file {file_id} exceeds the 32-bit record index range")]
     RecordIndexOverflow { file_id: u32 },
-    #[error(
-        "invalid date/time {0:?}: expected YYYY-MM-DD, YYYY-MM-DD HH:MM or YYYY-MM-DD HH:MM:SS"
-    )]
+    // Shown under the date inputs as-is; the frontend keys on the prefix.
+    #[error("존재하지 않는 날짜·시각입니다: {0:?}")]
     BadDateTime(String),
     #[error("rule evaluation failed: {0}")]
     RuleRun(String),

@@ -69,10 +69,16 @@ jobs:
           Set-Content -Path $blocker -Value "x"
           $target = Join-Path $blocker "cases"
 
-          $out = & "target\release\awslog-analyzer.exe" --cases-dir $target 2>&1
-          $code = $LASTEXITCODE
+          # `&` gives no $LASTEXITCODE for a GUI-subsystem exe (pwsh does not
+          # wait for it); Start-Process does, and the redirect files keep the
+          # stderr diagnostic out of pwsh's error stream.
+          $err = Join-Path $env:RUNNER_TEMP "unwritable.err"
+          $p = Start-Process -FilePath "target\release\awslog-analyzer.exe" `
+            -ArgumentList @("--cases-dir", $target) -Wait -PassThru -NoNewWindow `
+            -RedirectStandardError $err
+          $out = Get-Content $err -Raw
           Write-Host $out
-          if ($code -ne 1) { throw "expected exit 1 on unwritable root, got $code" }
+          if ($p.ExitCode -ne 1) { throw "expected exit 1 on unwritable root, got $($p.ExitCode)" }
           if ($out -notmatch "not writable") { throw "missing diagnostic in stderr" }
           if ($out -notmatch "AWSLOG_CASES_DIR") { throw "missing remediation hint" }
           if (Test-Path $target) { throw "case root created despite failure" }
