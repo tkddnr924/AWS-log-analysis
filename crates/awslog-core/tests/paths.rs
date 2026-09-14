@@ -71,18 +71,18 @@ fn prepare_creates_missing_root() {
     assert_eq!(prepared.path(), root);
 }
 
+// Windows' read-only bit does not stop child creation; denying write there
+// needs an ACL, which the Windows CI does with icacls against the real exe
+// (build-windows.yml "Verify unwritable root fails").
+#[cfg(unix)]
 #[test]
 fn prepare_fails_on_read_only_parent_without_falling_back() {
+    use std::os::unix::fs::PermissionsExt;
+
     let tmp = tempfile::tempdir().unwrap();
     let parent = tmp.path().join("locked");
     std::fs::create_dir(&parent).unwrap();
-    let mut perms = std::fs::metadata(&parent).unwrap().permissions();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        perms.set_mode(0o555);
-    }
-    std::fs::set_permissions(&parent, perms).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     let err = paths::prepare(&parent.join("cases")).expect_err("must not fall back");
 
