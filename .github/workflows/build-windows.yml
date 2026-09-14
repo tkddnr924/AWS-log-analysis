@@ -41,7 +41,7 @@ jobs:
         run: cargo test -p awslog-core --release
 
       - name: Build portable exe
-        run: cargo build --release -p awslog-analyzer
+        run: cargo build --release -p awslog-analyzer --features custom-protocol
 
       # The exe must not import the VC++ runtime DLLs (.cargo/config.toml
       # crt-static): a machine with an older redistributable crashes inside

@@ -25,5 +25,11 @@ parking_lot = "0.12.5"
 time.workspace = true
 serde_json = "1.0.151"
 
+# Without this Tauri treats the binary as a dev build and loads `devUrl`
+# (localhost:1420) instead of the embedded `frontendDist`. `cargo tauri
+# build` enables it implicitly; the CI's plain `cargo build` must pass it.
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dev-dependencies]
 tempfile = "3"
