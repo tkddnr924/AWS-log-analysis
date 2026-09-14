@@ -24,9 +24,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # DuckDB's bundled C++ is ~20 min on this runner. Keep the cache even
+      # when a later verification step fails, or every retry rebuilds it.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+          cache-on-failure: true
 
       - name: Install frontend deps
         run: npm ci
