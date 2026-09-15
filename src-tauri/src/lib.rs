@@ -73,10 +73,128 @@ impl Drop for ParseRun<'_> {
     }
 }
 
-/// Startup state shared with commands.
+/// The open database instance of a case. Only ever used to spawn handles;
+/// the mutex exists because `Store` is not `Sync`.
+struct CaseDb(Mutex<Store>);
+
+/// A connection to a case's database. Keeps the instance it came from alive,
+/// so a command still running on a case that was meanwhile switched away
+/// from and back gets the same instance, never a second one.
+struct CaseHandle {
+    store: Store,
+    _db: Arc<CaseDb>,
+}
+
+impl std::ops::Deref for CaseHandle {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for CaseHandle {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+}
+
+/// One database instance per case file per process.
+///
+/// duckdb-rs opens through `duckdb_open_ext`, which bypasses DuckDB's
+/// instance cache: every `Store::open` on the same file is an independent
+/// database instance. Two instances on one file in one process are refused
+/// on Windows ("conflicting lock is held in <this exe>") and on Unix they
+/// silently stop seeing each other's writes. So a case is opened once and
+/// every command works on a `try_clone` handle of that instance.
+///
+/// `current` keeps the most recently used case open between commands; one
+/// only, since each instance may hold up to `memory_limit` of cached blocks
+/// and the UI shows one case at a time. `live` finds instances that handles
+/// in flight still hold after `current` moved on.
+#[derive(Default)]
+struct StoreCache(Mutex<CacheState>);
+
+#[derive(Default)]
+struct CacheState {
+    current: Option<(String, Arc<CaseDb>)>,
+    live: std::collections::HashMap<String, std::sync::Weak<CaseDb>>,
+}
+
+impl StoreCache {
+    /// A handle on the case's database, opening it on first use.
+    fn open(
+        &self,
+        case_id: &str,
+        open: impl FnOnce() -> Result<Store, String>,
+    ) -> Result<CaseHandle, String> {
+        let mut state = self.0.lock();
+        let db = match state.live.get(case_id).and_then(std::sync::Weak::upgrade) {
+            Some(db) => db,
+            None => {
+                // Drop the previous case before opening: two idle instances
+                // would double the buffer pool ceiling.
+                state.current = None;
+                state.live.retain(|_, weak| weak.strong_count() > 0);
+                let db = Arc::new(CaseDb(Mutex::new(open()?)));
+                state.live.insert(case_id.to_owned(), Arc::downgrade(&db));
+                db
+            }
+        };
+        if !matches!(&state.current, Some((id, _)) if id == case_id) {
+            state.current = Some((case_id.to_owned(), db.clone()));
+        }
+        // A second connection on the same instance; readers use it too.
+        let store = db.0.lock().writer_handle().map_err(|e| e.to_string())?;
+        Ok(CaseHandle { store, _db: db })
+    }
+
+    /// Deletes a case's files, or refuses while a command still holds its
+    /// database. `remove_dir_all` takes `case.json` and `rules/` before it
+    /// reaches the locked `session.duckdb` on Windows, so letting the OS
+    /// refuse would leave a half-deleted case. Runs under the cache lock so
+    /// no handle can be opened in the meantime.
+    fn delete(
+        &self,
+        case_id: &str,
+        delete: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut state = self.0.lock();
+        if matches!(&state.current, Some((id, _)) if id == case_id) {
+            state.current = None;
+        }
+        if state
+            .live
+            .get(case_id)
+            .is_some_and(|w| w.strong_count() > 0)
+        {
+            return Err("케이스가 아직 사용 중입니다. 작업이 끝난 뒤 다시 시도하세요".to_owned());
+        }
+        state.live.remove(case_id);
+        delete()
+    }
+}
+
+/// Startup state shared with commands. Cloned into blocking workers.
+#[derive(Clone)]
 struct AppState {
     cases_root: CasesRoot,
     parse: Arc<ParseSlot>,
+    stores: Arc<StoreCache>,
+}
+
+impl AppState {
+    /// Opens a case's store with spills kept inside the case (docs/07).
+    fn store(&self, case_id: &str) -> Result<CaseHandle, String> {
+        let case_dir = self
+            .cases_root
+            .case_dir(case_id)
+            .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
+        self.stores.open(case_id, || {
+            let store = Store::open(&case_dir.join("session.duckdb")).map_err(|e| e.to_string())?;
+            store.set_temp_dir(&case_dir).map_err(|e| e.to_string())?;
+            Ok(store)
+        })
+    }
 }
 
 #[tauri::command]
@@ -232,7 +350,7 @@ async fn start_parse(
     mapping: Vec<MappingEntry>,
 ) -> Result<ParseResult, String> {
     let mapping = build_map(&mapping);
-    let cases_root = state.cases_root.clone();
+    let state = state.inner().clone();
     // Held for the whole command: dropping it frees the slot on every exit
     // path, including the `?` below and a panic in the worker.
     let Some(run) = state.parse.begin() else {
@@ -244,7 +362,8 @@ async fn start_parse(
         let input = PathBuf::from(&path);
         let now = OffsetDateTime::now_utc();
         let started = PrimitiveDateTime::new(now.date(), now.time());
-        let case = cases_root
+        let case = state
+            .cases_root
             .create_case(&input, started)
             .map_err(|e| e.to_string())?;
 
@@ -256,10 +375,15 @@ async fn start_parse(
         let mapping_json = serde_json::to_string_pretty(&mapping).map_err(|e| e.to_string())?;
         std::fs::write(case.dir().join("mapping.json"), mapping_json).map_err(|e| e.to_string())?;
 
-        let mut store = Store::create(&case.session_db(), case.id(), &input.display().to_string())
-            .map_err(|e| e.to_string())?;
-        // Keep DuckDB spill files inside the case (docs/07).
-        store.set_temp_dir(case.dir()).map_err(|e| e.to_string())?;
+        // Cached so the results view that follows reuses this instance
+        // instead of closing and reopening the file.
+        let mut store = state.stores.open(case.id(), || {
+            let store = Store::create(&case.session_db(), case.id(), &input.display().to_string())
+                .map_err(|e| e.to_string())?;
+            // Keep DuckDB spill files inside the case (docs/07).
+            store.set_temp_dir(case.dir()).map_err(|e| e.to_string())?;
+            Ok(store)
+        })?;
 
         let options = ParseOptions {
             cancel: Some(cancel.clone()),
@@ -298,7 +422,7 @@ async fn start_parse(
 
         // Rules are only registered here; each is evaluated over the stored
         // events when the analyst first opens it (docs/04 lazy evaluation).
-        match register_rules(&mut store, &cases_root.user_rules_dir(), case.dir()) {
+        match register_rules(&mut store, &state.cases_root.user_rules_dir(), case.dir()) {
             Ok(count) => case_log.info(&format!("rules registered {count}")),
             Err(e) => case_log.info(&format!("rule registration failed: {e}")),
         }
@@ -385,38 +509,26 @@ async fn evaluate_rule(
     case_id: String,
     rule_id: String,
 ) -> Result<u32, String> {
-    let cases_root = state.cases_root.clone();
-    let slot = state.parse.clone();
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        evaluate_rule_in(&slot, &cases_root, &case_id, &rule_id).map(|hits| hits as u32)
+        evaluate_rule_in(&state, &case_id, &rule_id).map(|hits| hits as u32)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-fn evaluate_rule_in(
-    slot: &ParseSlot,
-    cases_root: &CasesRoot,
-    case_id: &str,
-    rule_id: &str,
-) -> Result<u64, String> {
-    let _run = slot.begin().ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
-    let set = RuleSet::load_layered(&cases_root.user_rules_dir()).map_err(|e| e.to_string())?;
+fn evaluate_rule_in(state: &AppState, case_id: &str, rule_id: &str) -> Result<u64, String> {
+    let _run = state
+        .parse
+        .begin()
+        .ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
+    let set =
+        RuleSet::load_layered(&state.cases_root.user_rules_dir()).map_err(|e| e.to_string())?;
     let rule = set
         .rule(rule_id)
         .ok_or_else(|| format!("룰을 찾을 수 없습니다: {rule_id}"))?;
-    let mut store = open_case_store(cases_root, case_id)?;
+    let mut store = state.store(case_id)?;
     results::evaluate_rule(&mut store, rule).map_err(|e| e.to_string())
-}
-
-/// Opens a case's store with spills kept inside the case (docs/07).
-fn open_case_store(cases_root: &CasesRoot, case_id: &str) -> Result<Store, String> {
-    let case_dir = cases_root
-        .case_dir(case_id)
-        .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
-    let store = Store::open(&case_dir.join("session.duckdb")).map_err(|e| e.to_string())?;
-    store.set_temp_dir(&case_dir).map_err(|e| e.to_string())?;
-    Ok(store)
 }
 
 /// Lists rule groups and one page of matches for a case. The window's search
@@ -430,12 +542,13 @@ async fn query_results(
     rule_id: Option<String>,
     window: results::Window,
 ) -> Result<ResultPage, String> {
-    let cases_root = state.cases_root.clone();
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let case_dir = cases_root
+        let case_dir = state
+            .cases_root
             .case_dir(&case_id)
             .ok_or_else(|| format!("invalid case id: {case_id}"))?;
-        let mut store = Store::open(&case_dir.join("session.duckdb")).map_err(|e| e.to_string())?;
+        let mut store = state.store(&case_id)?;
         // Cases recorded before `rules.log_type` existed: fill it from the
         // rule snapshot so the sidebar can scope rules without re-evaluating.
         // Older cases may have no snapshot either; the current rules are the
@@ -443,7 +556,7 @@ async fn query_results(
         if store.rules_lack_log_type().map_err(|e| e.to_string())? {
             let candidates = [
                 RuleSet::load_dir(&case_dir.join("rules")),
-                RuleSet::load_layered(&cases_root.user_rules_dir()),
+                RuleSet::load_layered(&state.cases_root.user_rules_dir()),
             ];
             for set in candidates.into_iter().flatten() {
                 store
@@ -468,13 +581,9 @@ async fn get_raw_record(
     case_id: String,
     event_id: EventId,
 ) -> Result<Option<String>, String> {
-    let cases_root = state.cases_root.clone();
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let db = cases_root
-            .case_dir(&case_id)
-            .ok_or_else(|| format!("invalid case id: {case_id}"))?
-            .join("session.duckdb");
-        let store = Store::open(&db).map_err(|e| e.to_string())?;
+        let store = state.store(&case_id)?;
         results::raw_record(&store, event_id.0).map_err(|e| e.to_string())
     })
     .await
@@ -552,33 +661,30 @@ async fn save_rule(
     case_id: String,
     source: String,
 ) -> Result<String, String> {
-    let cases_root = state.cases_root.clone();
-    let slot = state.parse.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        save_rule_in(&slot, &cases_root, &case_id, &source)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || save_rule_in(&state, &case_id, &source))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
-fn save_rule_in(
-    slot: &ParseSlot,
-    cases_root: &CasesRoot,
-    case_id: &str,
-    source: &str,
-) -> Result<String, String> {
-    let _run = slot.begin().ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
-    let user_dir = cases_root.user_rules_dir();
+fn save_rule_in(state: &AppState, case_id: &str, source: &str) -> Result<String, String> {
+    let _run = state
+        .parse
+        .begin()
+        .ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
+    let user_dir = state.cases_root.user_rules_dir();
     let rule_id = write_user_rule(&user_dir, source)?;
     let set = RuleSet::load_layered(&user_dir).map_err(|e| e.to_string())?;
     let rule = set
         .rule(&rule_id)
         .ok_or_else(|| format!("저장한 룰을 다시 읽지 못했습니다: {rule_id}"))?;
-    let case_dir = cases_root
+    let case_dir = state
+        .cases_root
         .case_dir(case_id)
         .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
     RuleSet::snapshot_into(&user_dir, &case_dir.join("rules")).map_err(|e| e.to_string())?;
-    open_case_store(cases_root, case_id)?
+    state
+        .store(case_id)?
         .reset_rule(rule)
         .map_err(|e| e.to_string())?;
     Ok(rule_id)
@@ -594,32 +700,29 @@ async fn delete_rule(
     case_id: String,
     rule_id: String,
 ) -> Result<(), String> {
-    let cases_root = state.cases_root.clone();
-    let slot = state.parse.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        delete_rule_in(&slot, &cases_root, &case_id, &rule_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || delete_rule_in(&state, &case_id, &rule_id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
-fn delete_rule_in(
-    slot: &ParseSlot,
-    cases_root: &CasesRoot,
-    case_id: &str,
-    rule_id: &str,
-) -> Result<(), String> {
-    let _run = slot.begin().ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
-    let user_dir = cases_root.user_rules_dir();
+fn delete_rule_in(state: &AppState, case_id: &str, rule_id: &str) -> Result<(), String> {
+    let _run = state
+        .parse
+        .begin()
+        .ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
+    let user_dir = state.cases_root.user_rules_dir();
     let path = user_rule_path(&user_dir, rule_id)?;
     if path.is_file() {
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-        let case_dir = cases_root
+        let case_dir = state
+            .cases_root
             .case_dir(case_id)
             .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
         RuleSet::snapshot_into(&user_dir, &case_dir.join("rules")).map_err(|e| e.to_string())?;
     }
-    open_case_store(cases_root, case_id)?
+    state
+        .store(case_id)?
         .remove_rule(rule_id)
         .map_err(|e| e.to_string())
 }
@@ -660,13 +763,10 @@ async fn count_rule_matches(
     case_id: String,
     source: String,
 ) -> Result<RuleHits, String> {
-    let cases_root = state.cases_root.clone();
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let set = RuleSet::from_source(&source).map_err(|e| e.to_string())?;
-        let case_dir = cases_root
-            .case_dir(&case_id)
-            .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
-        let store = Store::open(&case_dir.join("session.duckdb")).map_err(|e| e.to_string())?;
+        let store = state.store(&case_id)?;
         let count = results::count_matches(&store, &set).map_err(|e| e.to_string())?;
         Ok(RuleHits {
             hits: count.hits as u32,
@@ -695,12 +795,9 @@ async fn get_event(
     case_id: String,
     event_id: EventId,
 ) -> Result<Vec<FieldPreview>, String> {
-    let cases_root = state.cases_root.clone();
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let case_dir = cases_root
-            .case_dir(&case_id)
-            .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
-        let store = Store::open(&case_dir.join("session.duckdb")).map_err(|e| e.to_string())?;
+        let store = state.store(&case_id)?;
         let fields = results::event_fields(&store, event_id.0).map_err(|e| e.to_string())?;
         Ok(fields
             .into_iter()
@@ -725,12 +822,9 @@ async fn query_events(
     case_id: String,
     window: results::Window,
 ) -> Result<results::EventPage, String> {
-    let cases_root = state.cases_root.clone();
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let case_dir = cases_root
-            .case_dir(&case_id)
-            .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
-        let store = Store::open(&case_dir.join("session.duckdb")).map_err(|e| e.to_string())?;
+        let store = state.store(&case_id)?;
         results::all_events(&store, &window).map_err(|e| e.to_string())
     })
     .await
@@ -742,12 +836,19 @@ async fn query_events(
 #[tauri::command]
 #[specta::specta]
 async fn delete_case(state: tauri::State<'_, AppState>, case_id: String) -> Result<(), String> {
-    let cases_root = state.cases_root.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        cases_root.delete_case(&case_id).map_err(|e| e.to_string())
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || delete_case_in(&state, &case_id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn delete_case_in(state: &AppState, case_id: &str) -> Result<(), String> {
+    state.stores.delete(case_id, || {
+        state
+            .cases_root
+            .delete_case(case_id)
+            .map_err(|e| e.to_string())
     })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Past cases, newest first. Reads `case.json` only so the list is cheap
@@ -951,6 +1052,7 @@ pub fn run() {
             app.manage(AppState {
                 cases_root: root.clone(),
                 parse: Arc::new(ParseSlot::default()),
+                stores: Arc::new(StoreCache::default()),
             });
             Ok(())
         })
@@ -961,9 +1063,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_mapping, delete_rule_in, evaluate_rule_in, fit_window, paths, preview_mapping,
-        save_rule_in, user_rule_path, write_user_rule, CasesRoot, Field, FieldPreview,
-        MappingEntry, OffsetDateTime, ParseSlot, Path, PrimitiveDateTime, Store, MIN_WINDOW,
+        default_mapping, delete_case_in, delete_rule_in, evaluate_rule_in, fit_window, paths,
+        preview_mapping, save_rule_in, user_rule_path, write_user_rule, AppState, Arc, CasesRoot,
+        Field, FieldPreview, MappingEntry, OffsetDateTime, ParseSlot, Path, PrimitiveDateTime,
+        Store, StoreCache, MIN_WINDOW,
     };
     use std::sync::atomic::Ordering;
 
@@ -1065,10 +1168,21 @@ mod tests {
         assert!(rows.iter().all(|r| !r.sources.is_empty()));
     }
 
-    /// A parsed case with one event, so rule runs have something to match.
-    fn seeded_case() -> (tempfile::TempDir, CasesRoot, String) {
+    /// A parsed case with one event, so rule runs have something to match,
+    /// and an app state over its root as the commands would see it.
+    fn seeded_case() -> (tempfile::TempDir, AppState, String) {
         let tmp = tempfile::tempdir().unwrap();
         let root = paths::prepare(&tmp.path().join("cases")).unwrap();
+        let id = seed_case(&root);
+        let state = AppState {
+            cases_root: root,
+            parse: Arc::new(ParseSlot::default()),
+            stores: Arc::new(StoreCache::default()),
+        };
+        (tmp, state, id)
+    }
+
+    fn seed_case(root: &CasesRoot) -> String {
         let case = root
             .create_case(Path::new("/logs/prod"), {
                 let now = OffsetDateTime::now_utc();
@@ -1104,8 +1218,7 @@ mod tests {
                 raw: Some(r#"{"eventName":"ConsoleLogin"}"#.to_owned()),
             }])
             .unwrap();
-        let id = case.id().to_owned();
-        (tmp, root, id)
+        case.id().to_owned()
     }
 
     const HIT: &str = r#"rule my_hit {
@@ -1116,59 +1229,68 @@ mod tests {
 
     #[test]
     fn saving_a_rule_registers_it_pending_and_selecting_evaluates_it() {
-        let (_tmp, root, case_id) = seeded_case();
-        let slot = ParseSlot::default();
+        let (_tmp, state, case_id) = seeded_case();
 
-        let rule_id = save_rule_in(&slot, &root, &case_id, HIT).unwrap();
+        let rule_id = save_rule_in(&state, &case_id, HIT).unwrap();
 
         assert_eq!(rule_id, "my_hit");
         // One rule per file under cases/rules, named after its id, so delete
         // is a file delete.
-        assert!(root.user_rules_dir().join("my_hit.yar").is_file());
-        let case_dir = root.case_dir(&case_id).unwrap();
+        assert!(state
+            .cases_root
+            .user_rules_dir()
+            .join("my_hit.yar")
+            .is_file());
+        let case_dir = state.cases_root.case_dir(&case_id).unwrap();
         // Snapshotted beside the case so the result stays explainable.
         assert!(case_dir.join("rules/user-my_hit.yar").is_file());
-        let store = Store::open(&case_dir.join("session.duckdb")).unwrap();
-        let groups = store.rule_groups(&Default::default()).unwrap();
+        let groups = state
+            .store(&case_id)
+            .unwrap()
+            .rule_groups(&Default::default())
+            .unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].rule_id, "my_hit");
         assert!(!groups[0].evaluated, "saving must not scan the case");
-        drop(store);
 
-        let hits = evaluate_rule_in(&slot, &root, &case_id, "my_hit").unwrap();
+        let hits = evaluate_rule_in(&state, &case_id, "my_hit").unwrap();
 
         assert_eq!(hits, 1);
-        let store = Store::open(&case_dir.join("session.duckdb")).unwrap();
-        let groups = store.rule_groups(&Default::default()).unwrap();
+        let groups = state
+            .store(&case_id)
+            .unwrap()
+            .rule_groups(&Default::default())
+            .unwrap();
         assert!(groups[0].evaluated);
         assert_eq!(groups[0].match_count, 1);
     }
 
     #[test]
     fn deleting_a_rule_removes_it_from_the_case_and_the_snapshot() {
-        let (_tmp, root, case_id) = seeded_case();
-        let slot = ParseSlot::default();
-        save_rule_in(&slot, &root, &case_id, HIT).unwrap();
-        evaluate_rule_in(&slot, &root, &case_id, "my_hit").unwrap();
+        let (_tmp, state, case_id) = seeded_case();
+        save_rule_in(&state, &case_id, HIT).unwrap();
+        evaluate_rule_in(&state, &case_id, "my_hit").unwrap();
 
-        delete_rule_in(&slot, &root, &case_id, "my_hit").unwrap();
+        delete_rule_in(&state, &case_id, "my_hit").unwrap();
 
-        let case_dir = root.case_dir(&case_id).unwrap();
-        let store = Store::open(&case_dir.join("session.duckdb")).unwrap();
+        let case_dir = state.cases_root.case_dir(&case_id).unwrap();
+        let store = state.store(&case_id).unwrap();
         assert!(store.rule_groups(&Default::default()).unwrap().is_empty());
         assert_eq!(store.matched_event_count(&Default::default()).unwrap(), 0);
-        assert!(!root.user_rules_dir().join("my_hit.yar").exists());
+        assert!(!state
+            .cases_root
+            .user_rules_dir()
+            .join("my_hit.yar")
+            .exists());
         // The snapshot must not keep claiming a deleted rule was applied.
         assert!(!case_dir.join("rules/user-my_hit.yar").exists());
     }
 
     #[test]
     fn a_rule_that_matches_nothing_is_recorded_with_zero_hits() {
-        let (_tmp, root, case_id) = seeded_case();
-        let slot = ParseSlot::default();
+        let (_tmp, state, case_id) = seeded_case();
         save_rule_in(
-            &slot,
-            &root,
+            &state,
             &case_id,
             r#"rule my_miss {
                 meta: description = "Never" severity = "high"
@@ -1178,17 +1300,75 @@ mod tests {
         )
         .unwrap();
 
-        let hits = evaluate_rule_in(&slot, &root, &case_id, "my_miss").unwrap();
+        let hits = evaluate_rule_in(&state, &case_id, "my_miss").unwrap();
 
         assert_eq!(hits, 0);
-        let case_dir = root.case_dir(&case_id).unwrap();
-        let store = Store::open(&case_dir.join("session.duckdb")).unwrap();
-        let groups = store.rule_groups(&Default::default()).unwrap();
+        let groups = state
+            .store(&case_id)
+            .unwrap()
+            .rule_groups(&Default::default())
+            .unwrap();
         // Listed, not dropped: an unexercised rule must be distinguishable
         // from one that was never loaded.
         assert_eq!(groups.len(), 1);
         assert!(groups[0].evaluated);
         assert_eq!(groups[0].match_count, 0);
+    }
+
+    /// Commands overlap (a results poll while a rule is saved), and each
+    /// gets its own handle. Those handles must be connections to one
+    /// database instance: a handle taken earlier sees a later write. Two
+    /// independent opens of the file never would, and on Windows the second
+    /// open is refused outright with a lock held by this very process.
+    #[test]
+    fn handles_on_one_case_share_a_single_database_instance() {
+        let (_tmp, state, case_id) = seeded_case();
+        let earlier = state.store(&case_id).unwrap();
+
+        save_rule_in(&state, &case_id, HIT).unwrap();
+
+        let groups = earlier.rule_groups(&Default::default()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rule_id, "my_hit");
+    }
+
+    /// The cache keeps one idle case, but a command may still be running on
+    /// a case the analyst has switched away from. Coming back to it must
+    /// reuse the instance that command holds, not open a second one.
+    #[test]
+    fn returning_to_a_case_a_running_command_still_holds_reuses_its_instance() {
+        let (_tmp, state, case_a) = seeded_case();
+        let case_b = seed_case(&state.cases_root);
+        let held = state.store(&case_a).unwrap();
+
+        state.store(&case_b).unwrap();
+        save_rule_in(&state, &case_a, HIT).unwrap();
+
+        let groups = held.rule_groups(&Default::default()).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].rule_id, "my_hit");
+    }
+
+    /// `remove_dir_all` would take `case.json` and `rules/` before failing
+    /// on the locked database, leaving a case that is neither listed nor
+    /// gone. While a command holds the case, deletion must not touch it.
+    #[test]
+    fn deleting_a_case_a_command_still_holds_is_refused_and_leaves_it_intact() {
+        let (_tmp, state, case_id) = seeded_case();
+        save_rule_in(&state, &case_id, HIT).unwrap();
+        let case_dir = state.cases_root.case_dir(&case_id).unwrap();
+        let held = state.store(&case_id).unwrap();
+
+        assert!(delete_case_in(&state, &case_id).is_err());
+
+        assert!(case_dir.join("session.duckdb").is_file());
+        assert!(case_dir.join("rules/user-my_hit.yar").is_file());
+        // Still usable through the held handle: nothing was pulled from under it.
+        assert_eq!(held.rule_groups(&Default::default()).unwrap().len(), 1);
+        drop(held);
+
+        delete_case_in(&state, &case_id).unwrap();
+        assert!(!case_dir.exists());
     }
 
     #[test]
@@ -1217,13 +1397,12 @@ mod tests {
 
     #[test]
     fn rule_evaluation_is_refused_while_a_parse_holds_the_slot() {
-        let (_tmp, root, case_id) = seeded_case();
-        let slot = ParseSlot::default();
-        let _parse = slot.begin().unwrap();
+        let (_tmp, state, case_id) = seeded_case();
+        let _parse = state.parse.begin().unwrap();
 
         // Both write the same database, so they must not overlap.
-        assert!(evaluate_rule_in(&slot, &root, &case_id, "x").is_err());
-        assert!(save_rule_in(&slot, &root, &case_id, HIT).is_err());
+        assert!(evaluate_rule_in(&state, &case_id, "x").is_err());
+        assert!(save_rule_in(&state, &case_id, HIT).is_err());
     }
 
     #[test]
