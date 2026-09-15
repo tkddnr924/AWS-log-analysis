@@ -54,6 +54,22 @@ impl LogType {
             Self::Unknown => "unknown",
         }
     }
+
+    /// The inverse of [`Self::as_str`], for names that crossed IPC.
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            Self::CloudTrail,
+            Self::AlbAccess,
+            Self::WafAcl,
+            Self::ApigwAccess,
+            Self::NginxAccess,
+            Self::CloudTrailDigest,
+            Self::ConfigSnapshot,
+            Self::Unknown,
+        ]
+        .into_iter()
+        .find(|t| t.as_str() == name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +128,28 @@ impl Detection {
     }
 }
 
+/// The decoded head of a gzip file, up to [`HEAD_LIMIT`] bytes, and whether
+/// the stream ended early (a cut-off member still leaves usable bytes).
+/// Shared by detection and the pre-parse preview so both look at the same
+/// bytes.
+pub fn decoded_head(path: &Path) -> Result<(Vec<u8>, bool), DetectError> {
+    let io = |source| DetectError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = File::open(path).map_err(io)?;
+    let mut decoder = MultiGzDecoder::new(BufReader::new(file));
+    let mut head = Vec::with_capacity(HEAD_LIMIT.min(64 * 1024));
+    let read_result = (&mut decoder)
+        .take(HEAD_LIMIT as u64)
+        .read_to_end(&mut head);
+    match read_result {
+        Ok(_) => Ok((head, false)),
+        Err(_) if !head.is_empty() => Ok((head, true)),
+        Err(source) => Err(io(source)),
+    }
+}
+
 /// Inspects one candidate. Damage is reported in the result, never propagated
 /// as an error, so one bad file cannot abort a scan (NFR-4).
 pub fn detect_file(path: &Path) -> Result<Detection, DetectError> {
@@ -135,21 +173,14 @@ pub fn detect_file(path: &Path) -> Result<Detection, DetectError> {
         Err(_) => return Ok(Detection::unknown(path, "not gzip: file too short")),
     }
 
-    let file = File::open(path).map_err(|source| DetectError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut decoder = MultiGzDecoder::new(BufReader::new(file));
-    let mut head = Vec::with_capacity(HEAD_LIMIT.min(64 * 1024));
-    let read_result = (&mut decoder)
-        .take(HEAD_LIMIT as u64)
-        .read_to_end(&mut head);
-
-    let truncated_stream = match read_result {
-        Ok(_) => false,
-        // A cut-off member still leaves usable bytes; keep them and flag it.
-        Err(_) if !head.is_empty() => true,
-        Err(e) => return Ok(Detection::unknown(path, format!("gzip decode failed: {e}"))),
+    let (head, truncated_stream) = match decoded_head(path) {
+        Ok(head) => head,
+        Err(DetectError::Io { source, .. }) => {
+            return Ok(Detection::unknown(
+                path,
+                format!("gzip decode failed: {source}"),
+            ))
+        }
     };
 
     let head_cut = head.len() >= HEAD_LIMIT;
@@ -370,7 +401,7 @@ fn first_record_from_partial(text: &str) -> Option<SampleRecord> {
 
 /// Byte index just past the object starting at index 0, honouring strings
 /// and escapes. `None` if the object never closes within `text`.
-fn match_object_end(text: &str) -> Option<usize> {
+pub(crate) fn match_object_end(text: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut in_string = false;

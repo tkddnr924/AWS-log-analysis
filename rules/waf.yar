@@ -4,6 +4,7 @@
 rule waf_blocked_request
 {
     meta:
+        name        = "차단 요청"
         description = "WAF blocked a request"
         severity    = "medium"
         log_type    = "waf_acl"
@@ -18,6 +19,7 @@ rule waf_blocked_request
 rule waf_injection_block
 {
     meta:
+        name        = "인젝션 차단 (SQLi·XSS)"
         description = "WAF blocked a request matching an injection rule set (SQLi/XSS)"
         severity    = "high"
         log_type    = "waf_acl"

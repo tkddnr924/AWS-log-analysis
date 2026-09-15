@@ -3,7 +3,7 @@
 mod support;
 
 use awslog_core::model::NormalizedEvent;
-use awslog_core::results::{self, ResultQuery};
+use awslog_core::results::{self, Window};
 use awslog_core::rule::{Hit, RuleSet};
 use awslog_core::store::Store;
 use std::collections::BTreeMap;
@@ -48,7 +48,7 @@ fn seeded(count: u64) -> (tempfile::TempDir, Store, RuleSet) {
 
     let set = RuleSet::from_source(
         r#"rule root_login {
-               meta: description = "Root console login" severity = "high"
+               meta: name = "루트 콘솔 로그인" description = "Root console login" severity = "high"
                fields: $name = event_name == "ConsoleLogin"
                        $root = identity_type == "Root"
                condition: $name and $root
@@ -73,11 +73,12 @@ fn seeded(count: u64) -> (tempfile::TempDir, Store, RuleSet) {
 fn groups_results_by_rule_with_counts() {
     let (_tmp, store, _set) = seeded(30);
 
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
 
     assert_eq!(page.groups.len(), 1);
     let group = &page.groups[0];
     assert_eq!(group.rule_id, "root_login");
+    assert_eq!(group.name, "루트 콘솔 로그인");
     assert_eq!(group.severity, "high");
     assert_eq!(group.description, "Root console login");
     assert_eq!(group.match_count, 30);
@@ -87,56 +88,50 @@ fn groups_results_by_rule_with_counts() {
 fn paginates_matches_within_a_rule() {
     let (_tmp, store, _set) = seeded(250);
 
-    let first = results::query(
+    let first = results::rule_matches(
         &store,
-        &ResultQuery {
-            rule_id: Some("root_login".into()),
-            window: results::Window {
-                offset: 0,
-                limit: 100,
-                ..Default::default()
-            },
+        "root_login",
+        &Window {
+            offset: 0,
+            limit: 100,
+            ..Default::default()
         },
     )
     .unwrap();
-    let second = results::query(
+    let second = results::rule_matches(
         &store,
-        &ResultQuery {
-            rule_id: Some("root_login".into()),
-            window: results::Window {
-                offset: 100,
-                limit: 100,
-                ..Default::default()
-            },
+        "root_login",
+        &Window {
+            offset: 100,
+            limit: 100,
+            ..Default::default()
         },
     )
     .unwrap();
 
-    assert_eq!(first.matches.len(), 100);
-    assert_eq!(second.matches.len(), 100);
+    assert_eq!(first.rows.len(), 100);
+    assert_eq!(second.rows.len(), 100);
     // Pages must not overlap; the UI would show duplicates.
-    assert_ne!(first.matches[0].event_id, second.matches[0].event_id);
-    assert_eq!(first.total_matches, 250);
+    assert_ne!(first.rows[0].event_id, second.rows[0].event_id);
+    assert_eq!(first.total, 250);
 }
 
 #[test]
 fn a_match_row_carries_the_evidence_and_a_summary() {
     let (_tmp, store, _set) = seeded(5);
 
-    let page = results::query(
+    let page = results::rule_matches(
         &store,
-        &ResultQuery {
-            rule_id: Some("root_login".into()),
-            window: results::Window {
-                offset: 0,
-                limit: 10,
-                ..Default::default()
-            },
+        "root_login",
+        &Window {
+            offset: 0,
+            limit: 10,
+            ..Default::default()
         },
     )
     .unwrap();
 
-    let row = &page.matches[0];
+    let row = &page.rows[0];
     assert_eq!(row.event_name.as_deref(), Some("ConsoleLogin"));
     assert_eq!(row.source_ip.as_deref(), Some("203.0.113.10"));
     // Evidence travels with the row so the view never re-evaluates (docs/04).
@@ -170,7 +165,7 @@ fn unmatched_count_accounts_for_every_event() {
         .unwrap();
     streamer.finish(&mut sink).unwrap();
 
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
 
     assert_eq!(page.total_events, 2);
     assert_eq!(page.matched_events, 1);
@@ -262,7 +257,7 @@ fn rules_are_registered_unevaluated_and_evaluated_one_at_a_time() {
         .unwrap()
         .begin_rule_run(set.rules())
         .unwrap();
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
     assert_eq!(page.groups.len(), 3);
     assert!(page
         .groups
@@ -273,7 +268,7 @@ fn rules_are_registered_unevaluated_and_evaluated_one_at_a_time() {
     // One rule evaluated; the others stay pending.
     let hits = results::evaluate_rule(&mut store, set.rule("login").unwrap()).unwrap();
     assert_eq!(hits, 1);
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
     let login = page.groups.iter().find(|g| g.rule_id == "login").unwrap();
     assert!(login.evaluated);
     assert_eq!(login.match_count, 1);
@@ -299,7 +294,7 @@ fn rules_are_registered_unevaluated_and_evaluated_one_at_a_time() {
 
     // Re-evaluating replaces, never duplicates.
     results::evaluate_rule(&mut store, set.rule("login").unwrap()).unwrap();
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
     assert_eq!(
         page.groups
             .iter()
@@ -312,7 +307,7 @@ fn rules_are_registered_unevaluated_and_evaluated_one_at_a_time() {
     // A saved rule comes back pending; a removed rule is gone from the case.
     store.reset_rule(set.rule("login").unwrap()).unwrap();
     store.remove_rule("get").unwrap();
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
     let ids: Vec<_> = page
         .groups
         .iter()
@@ -399,7 +394,7 @@ fn log_type_filter_narrows_events_groups_and_matches() {
         .unwrap();
     streamer.finish(&mut sink).unwrap();
 
-    let all = results::query(&store, &ResultQuery::default()).unwrap();
+    let all = results::query(&store, &Window::default()).unwrap();
     let mut types: Vec<_> = all
         .log_types
         .iter()
@@ -409,19 +404,12 @@ fn log_type_filter_narrows_events_groups_and_matches() {
     assert_eq!(types, [("alb_access", 2), ("cloudtrail", 2)]);
     assert_eq!(all.groups.len(), 3);
 
-    let window = results::Window {
+    let window = Window {
         limit: 10,
         log_type: Some("alb_access".into()),
         ..Default::default()
     };
-    let alb_page = results::query(
-        &store,
-        &ResultQuery {
-            rule_id: Some("any_root".into()),
-            window: window.clone(),
-        },
-    )
-    .unwrap();
+    let alb_page = results::query(&store, &window).unwrap();
 
     assert_eq!(alb_page.total_events, 2);
     assert_eq!(alb_page.matched_events, 2);
@@ -434,9 +422,10 @@ fn log_type_filter_narrows_events_groups_and_matches() {
         .collect();
     groups.sort();
     assert_eq!(groups, [("alb_get", 2), ("any_root", 2)]);
-    assert_eq!(alb_page.total_matches, 2);
-    assert!(alb_page
-        .matches
+    let alb_matches = results::rule_matches(&store, "any_root", &window).unwrap();
+    assert_eq!(alb_matches.total, 2);
+    assert!(alb_matches
+        .rows
         .iter()
         .all(|m| m.event_name.as_deref() == Some("GET")));
 
@@ -479,10 +468,303 @@ fn reopening_an_older_case_adds_the_rule_log_type_column() {
     // The scope was stored in the migrated column; the rule is not listed
     // because this case holds no ALB events.
     assert!(!store.rules_lack_log_type().unwrap());
-    assert!(results::query(&store, &ResultQuery::default())
+    assert!(results::query(&store, &Window::default())
         .unwrap()
         .groups
         .is_empty());
+}
+
+#[test]
+fn a_rule_registered_before_the_name_column_is_listed_under_its_id() {
+    // Cases hold rule rows written by older builds; the sidebar shows the
+    // name alone, so an absent one must read as the id, not as nothing.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("s.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rules (rule_id VARCHAR PRIMARY KEY, severity VARCHAR NOT NULL,
+                                 description VARCHAR NOT NULL, log_type VARCHAR,
+                                 evaluated BOOLEAN DEFAULT true);
+             INSERT INTO rules VALUES ('old_rule', 'low', 'from an older build', NULL, true);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db).unwrap();
+
+    let page = results::query(&store, &Window::default()).unwrap();
+
+    assert_eq!(page.groups.len(), 1);
+    assert_eq!(page.groups[0].name, "old_rule");
+}
+
+#[test]
+fn rule_names_are_backfilled_from_the_current_rules_without_reevaluating() {
+    // The label is display data: an older case may take it from today's rule
+    // pack. Only `meta: name` fills a gap — a rule without one must not pin
+    // its id into the column and block a better source later.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("s.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rules (rule_id VARCHAR PRIMARY KEY, severity VARCHAR NOT NULL,
+                                 description VARCHAR NOT NULL, log_type VARCHAR,
+                                 evaluated BOOLEAN DEFAULT true);
+             INSERT INTO rules VALUES ('named', 'low', 'x', NULL, true),
+                                      ('nameless', 'low', 'y', NULL, true);",
+        )
+        .unwrap();
+    }
+    let mut store = Store::open(&db).unwrap();
+    assert!(store.rules_lack_name().unwrap());
+    let set = RuleSet::from_source(
+        r#"rule named { meta: name = "이름 있음" fields: $n = event_name == "a" condition: $n }
+           rule nameless { fields: $n = event_name == "b" condition: $n }"#,
+    )
+    .unwrap();
+
+    store.backfill_rule_names(set.rules()).unwrap();
+
+    let page = results::query(&store, &Window::default()).unwrap();
+    let name = |id: &str| {
+        page.groups
+            .iter()
+            .find(|g| g.rule_id == id)
+            .unwrap()
+            .name
+            .clone()
+    };
+    assert_eq!(name("named"), "이름 있음");
+    assert_eq!(name("nameless"), "nameless");
+    assert!(store.rules_lack_name().unwrap());
+}
+
+#[test]
+fn a_rules_page_is_served_from_the_match_table_alone() {
+    // Paging a rule must not join the event table: on a 300M-row case that
+    // was a full probe per page. Everything the table shows is copied into
+    // the match row when the hit is recorded — so the page, its count, its
+    // scope and its search all survive the events being gone.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("s.duckdb");
+    let set =
+        RuleSet::from_source(r#"rule everything { fields: $n = event_name exists condition: $n }"#)
+            .unwrap();
+    {
+        let mut store = Store::create(&db, "c1", "/logs").unwrap();
+        store
+            .register_file(0, "a.json.gz", 1, "cloudtrail")
+            .unwrap();
+        store.register_file(1, "b.log.gz", 1, "alb_access").unwrap();
+        let mut trail = event(0, "GetObject");
+        trail.error_code = Some("AccessDenied".into());
+        trail.resources =
+            Some(r#"[{"ARN":"arn:aws:s3:::bucket/key","type":"AWS::S3::Object"}]"#.into());
+        trail.event_time = Some(datetime!(2026-09-12 00:00:00).assume_utc());
+        let mut alb = event(0, "GET");
+        alb.file_id = 1;
+        alb.request = Some(r#"{"method":"GET","url":"https://example.test/login"}"#.into());
+        alb.response = Some(r#"{"elb_status_code":503}"#.into());
+        alb.resources = Some(r#"{"target":"10.0.0.5:8080"}"#.into());
+        alb.event_time = Some(datetime!(2026-09-13 00:00:00).assume_utc());
+        store.append_events(&[trail, alb]).unwrap();
+        store.begin_rule_run(set.rules()).unwrap();
+        results::evaluate_rule(&mut store, set.rule("everything").unwrap()).unwrap();
+    }
+    duckdb::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DELETE FROM events")
+        .unwrap();
+    let store = Store::open(&db).unwrap();
+
+    let ten = Window {
+        limit: 10,
+        ..Default::default()
+    };
+    let page = results::rule_matches(&store, "everything", &ten).unwrap();
+    assert_eq!(page.total, 2);
+    assert_eq!(page.rows.len(), 2);
+    let trail = &page.rows[0];
+    assert_eq!(trail.log_type, "cloudtrail");
+    assert_eq!(trail.event_time.as_deref(), Some("2026-09-12 09:00:00.000"));
+    assert_eq!(trail.event_name.as_deref(), Some("GetObject"));
+    assert_eq!(trail.error_code.as_deref(), Some("AccessDenied"));
+    assert_eq!(trail.resource.as_deref(), Some("arn:aws:s3:::bucket/key"));
+    assert!(trail.url.is_none());
+    let alb = &page.rows[1];
+    assert_eq!(alb.log_type, "alb_access");
+    assert_eq!(alb.url.as_deref(), Some("https://example.test/login"));
+    assert_eq!(alb.status.as_deref(), Some("503"));
+    assert_eq!(alb.target.as_deref(), Some("10.0.0.5:8080"));
+    assert_eq!(alb.method.as_deref(), Some("GET"));
+
+    let alb_only = Window {
+        log_type: Some("alb_access".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        results::rule_matches(&store, "everything", &alb_only)
+            .unwrap()
+            .total,
+        1
+    );
+    assert_eq!(
+        results::query(&store, &alb_only).unwrap().groups[0].match_count,
+        1
+    );
+    let on_the_12th = Window {
+        from: Some("2026-09-12".into()),
+        to: Some("2026-09-12".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        results::rule_matches(&store, "everything", &on_the_12th)
+            .unwrap()
+            .total,
+        1
+    );
+    let searched = Window {
+        search: "getobject".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        results::rule_matches(&store, "everything", &searched)
+            .unwrap()
+            .total,
+        1
+    );
+}
+
+#[test]
+fn an_older_case_gets_its_match_summaries_rebuilt_on_open() {
+    // Hits recorded before the summary columns existed are kept: the
+    // summaries are fetched once on open, by event id, instead of running
+    // every rule again over the whole case.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("s.duckdb");
+    {
+        let mut store = Store::create(&db, "c1", "/logs").unwrap();
+        store
+            .register_file(0, "a.json.gz", 1, "cloudtrail")
+            .unwrap();
+        store.register_file(1, "b.log.gz", 1, "alb_access").unwrap();
+        let mut alb = event(0, "GET");
+        alb.file_id = 1;
+        alb.request = Some(r#"{"method":"GET","url":"https://example.test/login"}"#.into());
+        store
+            .append_events(&[event(0, "GetObject"), event(1, "PutObject"), alb])
+            .unwrap();
+    }
+    duckdb::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE rule_matches;
+             CREATE TABLE rule_matches (match_id UBIGINT PRIMARY KEY, rule_id VARCHAR NOT NULL,
+                                        event_id UBIGINT NOT NULL, matched_fields JSON NOT NULL);
+             INSERT INTO rule_matches VALUES
+                 (0, 'everything', 0, '{\"$n\": \"GetObject\"}'),
+                 (1, 'everything', 4294967296, '{}'),
+                 (2, 'gets', 4294967296, '{}');
+             INSERT INTO rules (rule_id, severity, description, log_type, evaluated)
+                 VALUES ('everything', 'low', 'All', NULL, true),
+                        ('gets', 'low', 'GETs', 'alb_access', true);",
+        )
+        .unwrap();
+
+    let store = Store::open(&db).unwrap();
+
+    let ten = Window {
+        limit: 10,
+        ..Default::default()
+    };
+    let page = results::rule_matches(&store, "everything", &ten).unwrap();
+    assert_eq!(page.total, 2);
+    let trail = page.rows.iter().find(|r| r.event_id == 0).unwrap();
+    assert_eq!(trail.log_type, "cloudtrail");
+    assert_eq!(trail.event_name.as_deref(), Some("GetObject"));
+    let fields: BTreeMap<String, String> = serde_json::from_str(&trail.matched_fields).unwrap();
+    assert_eq!(fields.get("$n").map(String::as_str), Some("GetObject"));
+    let alb = page.rows.iter().find(|r| r.event_id == 1 << 32).unwrap();
+    assert_eq!(alb.log_type, "alb_access");
+    assert_eq!(alb.url.as_deref(), Some("https://example.test/login"));
+    let groups = results::query(
+        &store,
+        &Window {
+            log_type: Some("alb_access".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .groups;
+    let mut counts: Vec<_> = groups
+        .iter()
+        .map(|g| (g.rule_id.as_str(), g.match_count, g.evaluated))
+        .collect();
+    counts.sort();
+    assert_eq!(counts, [("everything", 1, true), ("gets", 1, true)]);
+
+    // A second open finds the new shape and leaves it alone.
+    drop(store);
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.match_count().unwrap(), 3);
+}
+
+#[test]
+fn a_match_migration_that_fails_midway_leaves_the_old_table_for_the_next_open() {
+    // The refill runs in batches of 10,000. If it dies after the first
+    // batch, nothing of it may persist: a new-shaped table holding half
+    // the hits would pass the shape check on the next open and be served
+    // as complete while the rules still read as evaluated.
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("s.duckdb");
+    {
+        let mut store = Store::create(&db, "c1", "/logs").unwrap();
+        store
+            .register_file(0, "a.json.gz", 1, "cloudtrail")
+            .unwrap();
+        store.append_events(&[event(0, "GetObject")]).unwrap();
+    }
+    duckdb::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "DROP TABLE rule_matches;
+             CREATE TABLE rule_matches (match_id UBIGINT PRIMARY KEY, rule_id VARCHAR NOT NULL,
+                                        event_id UBIGINT, matched_fields JSON NOT NULL);
+             INSERT INTO rule_matches SELECT range, 'r', 0, '{}' FROM range(10000);
+             INSERT INTO rule_matches VALUES (10000, 'r', NULL, '{}');
+             INSERT INTO rules (rule_id, severity, description, log_type, evaluated)
+                 VALUES ('r', 'low', 'R', NULL, true);",
+        )
+        .unwrap();
+
+    // The NULL id is unreadable as a u64: the second batch fails after the
+    // first was appended.
+    assert!(Store::open(&db).is_err());
+
+    let conn = duckdb::Connection::open(&db).unwrap();
+    let old_shape: bool = conn
+        .query_row(
+            "SELECT count(*) = 0 FROM information_schema.columns
+             WHERE table_name = 'rule_matches' AND column_name = 'log_type'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(old_shape, "the old table is back in place");
+    conn.execute(
+        "UPDATE rule_matches SET event_id = 0 WHERE event_id IS NULL",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.match_count().unwrap(), 10_001);
+    assert_eq!(
+        results::query(&store, &Window::default()).unwrap().groups[0].match_count,
+        10_001
+    );
 }
 
 #[test]
@@ -501,7 +783,7 @@ fn querying_a_case_without_matches_returns_empty_groups_not_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
 
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
 
     assert!(page.groups.is_empty());
     assert_eq!(page.total_events, 0);
@@ -513,7 +795,7 @@ fn a_rule_run_records_metadata_so_severity_never_degrades() {
     // could forget, which silently produced `unknown` severity.
     let (_tmp, store, _set) = seeded(2);
 
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
 
     assert_eq!(page.groups[0].severity, "high");
     assert_eq!(page.groups[0].description, "Root console login");
@@ -552,7 +834,7 @@ fn a_rule_that_matched_nothing_is_still_listed() {
         .unwrap();
     streamer.finish(&mut sink).unwrap();
 
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
 
     // A rule with no hits is coverage information: hiding it makes an
     // unexercised rule indistinguishable from one that was never loaded.
@@ -562,6 +844,8 @@ fn a_rule_that_matched_nothing_is_still_listed() {
     assert_eq!(miss.match_count, 0);
     assert_eq!(miss.severity, "low");
     assert_eq!(miss.description, "Matches nothing here");
+    // No `meta: name`: the id is the name, never an empty label.
+    assert_eq!(miss.name, "miss");
 }
 
 #[test]
@@ -764,8 +1048,8 @@ fn timed() -> (tempfile::TempDir, Store) {
     (tmp, store)
 }
 
-fn names(page: &results::ResultPage) -> Vec<&str> {
-    page.matches
+fn names(page: &results::EventPage) -> Vec<&str> {
+    page.rows
         .iter()
         .map(|m| m.event_name.as_deref().unwrap_or("—"))
         .collect()
@@ -775,28 +1059,24 @@ fn names(page: &results::ResultPage) -> Vec<&str> {
 fn a_rules_matches_are_ordered_oldest_first_unless_asked_otherwise() {
     let (_tmp, store) = timed();
 
-    let oldest = results::query(
+    let oldest = results::rule_matches(
         &store,
-        &ResultQuery {
-            rule_id: Some("everything".into()),
-            window: results::Window {
-                offset: 0,
-                limit: 10,
-                ..Default::default()
-            },
+        "everything",
+        &Window {
+            offset: 0,
+            limit: 10,
+            ..Default::default()
         },
     )
     .unwrap();
-    let newest = results::query(
+    let newest = results::rule_matches(
         &store,
-        &ResultQuery {
-            rule_id: Some("everything".into()),
-            window: results::Window {
-                offset: 0,
-                limit: 10,
-                newest_first: true,
-                ..Default::default()
-            },
+        "everything",
+        &Window {
+            offset: 0,
+            limit: 10,
+            newest_first: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -838,7 +1118,7 @@ fn the_all_tab_lists_only_rules_for_parsed_log_types() {
         .begin_rule_run(set.rules())
         .unwrap();
 
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
 
     let mut ids: Vec<_> = page.groups.iter().map(|g| g.rule_id.as_str()).collect();
     ids.sort();
@@ -865,7 +1145,7 @@ fn rule_log_types_can_be_backfilled_from_a_rule_set() {
         .unwrap();
     assert!(store.rules_lack_log_type().unwrap());
     assert_eq!(
-        results::query(&store, &ResultQuery::default())
+        results::query(&store, &Window::default())
             .unwrap()
             .groups
             .len(),
@@ -883,7 +1163,7 @@ fn rule_log_types_can_be_backfilled_from_a_rule_set() {
         .unwrap();
 
     assert!(!store.rules_lack_log_type().unwrap());
-    assert!(results::query(&store, &ResultQuery::default())
+    assert!(results::query(&store, &Window::default())
         .unwrap()
         .groups
         .is_empty());
@@ -900,16 +1180,10 @@ fn a_date_range_narrows_every_view_in_kst() {
         ..Default::default()
     };
 
-    let page = results::query(
-        &store,
-        &ResultQuery {
-            rule_id: Some("everything".into()),
-            window: window.clone(),
-        },
-    )
-    .unwrap();
-    assert_eq!(names(&page), ["ConsoleLogin"]);
-    assert_eq!(page.total_matches, 1);
+    let matches = results::rule_matches(&store, "everything", &window).unwrap();
+    assert_eq!(names(&matches), ["ConsoleLogin"]);
+    assert_eq!(matches.total, 1);
+    let page = results::query(&store, &window).unwrap();
     assert_eq!(page.groups[0].match_count, 1);
     // The timeless event is excluded: it cannot be placed in the range.
     assert_eq!(page.total_events, 1);
@@ -980,7 +1254,7 @@ fn backfill_never_overwrites_a_scope_already_restored() {
         .register_file(0, "a.json.gz", 1, "cloudtrail")
         .unwrap();
     store.append_events(&[event(0, "ConsoleLogin")]).unwrap();
-    let page = results::query(&store, &ResultQuery::default()).unwrap();
+    let page = results::query(&store, &Window::default()).unwrap();
     let ids: Vec<_> = page.groups.iter().map(|g| g.rule_id.as_str()).collect();
     assert_eq!(ids, ["b"], "a kept alb_access; b took cloudtrail");
 }
@@ -1033,46 +1307,41 @@ fn bounds_accept_a_time_of_day_and_are_inclusive_at_their_unit() {
 fn search_narrows_a_rules_matches_and_the_total_follows_the_filter() {
     let (_tmp, store) = timed();
 
-    let page = results::query(
-        &store,
-        &ResultQuery {
-            rule_id: Some("everything".into()),
-            window: results::Window {
-                offset: 0,
-                limit: 10,
-                search: "console".into(),
-                ..Default::default()
-            },
-        },
-    )
-    .unwrap();
+    let window = Window {
+        offset: 0,
+        limit: 10,
+        search: "console".into(),
+        ..Default::default()
+    };
+    let page = results::rule_matches(&store, "everything", &window).unwrap();
 
     // Case-insensitive, and the count under the table must describe the
     // filtered list — not the rule's full hit count.
     assert_eq!(names(&page), ["ConsoleLogin"]);
-    assert_eq!(page.total_matches, 1);
+    assert_eq!(page.total, 1);
     // The rule group keeps its real hit count: the sidebar is not filtered.
-    assert_eq!(page.groups[0].match_count, 4);
+    assert_eq!(
+        results::query(&store, &window).unwrap().groups[0].match_count,
+        4
+    );
 }
 
 #[test]
 fn search_covers_every_column_the_table_shows() {
     let (_tmp, store) = timed();
     let hits = |needle: &str| {
-        results::query(
+        results::rule_matches(
             &store,
-            &ResultQuery {
-                rule_id: Some("everything".into()),
-                window: results::Window {
-                    offset: 0,
-                    limit: 10,
-                    search: needle.into(),
-                    ..Default::default()
-                },
+            "everything",
+            &Window {
+                offset: 0,
+                limit: 10,
+                search: needle.into(),
+                ..Default::default()
             },
         )
         .unwrap()
-        .total_matches
+        .total
     };
 
     assert_eq!(hits("198.51.100.7"), 1, "source ip");

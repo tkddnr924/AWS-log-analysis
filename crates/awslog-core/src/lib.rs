@@ -8,6 +8,8 @@ pub mod model;
 pub mod ndjson;
 pub mod parse;
 pub mod paths;
+pub mod payload;
+pub mod preview;
 pub mod report;
 pub mod results;
 pub mod rule;

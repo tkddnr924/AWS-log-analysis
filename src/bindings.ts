@@ -26,11 +26,30 @@ export const commands = {
 	/**  Cooperative cancel: the parse loop checks this between files and batches. */
 	cancelParse: () => __TAURI_INVOKE<void>("cancel_parse"),
 	/**
-	 *  Lists rule groups and one page of matches for a case. The window's search
-	 *  narrows the selected rule's matches only; its log type and date range
-	 *  narrow everything, group counts included.
+	 *  Lists rule groups and totals for a case. The window's log type and date
+	 *  range narrow everything, group counts included; its search is ignored.
+	 *  Rows are paged by `query_rule_matches` and `query_events`, so scrolling
+	 *  never repeats the case-level scans this does.
 	 */
-	queryResults: (caseId: string, ruleId: string | null, window: Window) => typedError<ResultPage, string>(__TAURI_INVOKE("query_results", { caseId, ruleId, window })),
+	queryResults: (caseId: string, window: Window) => typedError<ResultPage, string>(__TAURI_INVOKE("query_results", { caseId, window })),
+	/**
+	 *  One page of a rule's matches. Served from the match table alone, so a
+	 *  page costs the same on a 300M-event case as on a small one.
+	 */
+	queryRuleMatches: (caseId: string, ruleId: string, window: Window) => typedError<EventPage, string>(__TAURI_INVOKE("query_rule_matches", { caseId, ruleId, window })),
+	/**
+	 *  The payload paths a case's events hold (`request.*`, `response.*`,
+	 *  `resources.*`), counted while parsing, so the rule editor can offer what
+	 *  the data has instead of a fixed field list. `log_type` narrows to the
+	 *  tab being looked at.
+	 */
+	listPayloadKeys: (caseId: string, logType: string | null) => typedError<PayloadKey[], string>(__TAURI_INVOKE("list_payload_keys", { caseId, logType })),
+	/**
+	 *  FR-4: the head of one detected file as pieces with the column each one
+	 *  feeds, under the editor's current mapping (docs/03 "포맷 카드").
+	 *  `display_path` is the detection row's path, relative to `root`.
+	 */
+	previewHead: (root: string, displayPath: string, logType: string, mapping: MappingEntry[]) => typedError<HeadPreview, string>(__TAURI_INVOKE("preview_head", { root, displayPath, logType, mapping })),
 	/**  Fetches one original record on demand (never in list payloads). */
 	getRawRecord: (caseId: string, eventId: number | null) => typedError<string | null, string>(__TAURI_INVOKE("get_raw_record", { caseId, eventId })),
 	/**
@@ -79,7 +98,7 @@ export const commands = {
 	 *  mapping currently in the editor.
 	 */
 	getEvent: (caseId: string, eventId: number | null) => typedError<FieldPreview[], string>(__TAURI_INVOKE("get_event", { caseId, eventId })),
-	explainRule: (source: string) => typedError<RuleOutline, string>(__TAURI_INVOKE("explain_rule", { source })),
+	explainRule: (source: string) => typedError<RuleOutline, RuleProblem>(__TAURI_INVOKE("explain_rule", { source })),
 	/**
 	 *  Events a draft rule would match, without saving it or disturbing the
 	 *  case's recorded matches.
@@ -124,11 +143,11 @@ export type DetectionRow = {
 	note: string | null,
 };
 
-/**  One page of the all-events view, with the total that page was drawn from. */
+/**  One page of rows, with the total that page was drawn from. */
 export type EventPage = {
 	rows: MatchRow[],
 	/**
-	 *  Events matching the filter. Paging needs this, or the list stops short
+	 *  Rows matching the filter. Paging needs this, or the list stops short
 	 *  of the filtered set or asks for pages that do not exist.
 	 */
 	total: number,
@@ -139,6 +158,29 @@ export type FieldPreview = {
 	field: string,
 	label: string,
 	value: string | null,
+};
+
+export type HeadPreview = {
+	/**  Records found in the head, up to [`HEAD_RECORDS`]. */
+	records: number,
+	/**  Of those, records with both a time and an event name. */
+	mapped: number,
+	/**
+	 *  Event names (ALB: HTTP methods; WAF: actions) in the head, most
+	 *  frequent first.
+	 */
+	event_names: NameCount[],
+	pieces: Piece[],
+	/**
+	 *  Every leaf path across the head with the records that had it, so the
+	 *  UI can list what the first record happens to lack.
+	 */
+	paths: NameCount[],
+	/**
+	 *  Whether labels can be moved: only CloudTrail goes through the
+	 *  editable mapping; the other producers have fixed normalizers.
+	 */
+	editable: boolean,
 };
 
 /**  Parsed events per log type, for the type tabs. */
@@ -189,6 +231,12 @@ export type MatchRow = {
 	matched_fields: string,
 };
 
+/**  A name and how many head records carried it. */
+export type NameCount = {
+	name: string,
+	count: number,
+};
+
 /**  Progress while parsing into the session store. */
 export type ParseProgress = {
 	files_done: number,
@@ -211,6 +259,38 @@ export type ParseResult = {
 	cancelled: boolean,
 };
 
+/**
+ *  One JSON path seen inside a payload column while parsing, and how many
+ *  events of that log type carried it (docs/04 "페이로드 키").
+ */
+export type PayloadKey = {
+	log_type: string,
+	/**  As a rule spells it: `request.bucketName`, `resources.0.ARN`. */
+	path: string,
+	events: number,
+};
+
+/**
+ *  One piece of the first record: a leaf path (or, for ALB, a token
+ *  position) and its value, with the column it feeds.
+ */
+export type Piece = {
+	path: string,
+	value: string,
+	/**  `event_name`, `request.bucketName`, … ; `None` when nothing reads it. */
+	field: string | null,
+	/**
+	 *  What to print above the piece: the built-in field's display name or
+	 *  the rule path.
+	 */
+	label: string | null,
+};
+
+/**
+ *  The results sidebar: type tabs, date bounds, rule groups and the case
+ *  totals under the window's scope. Rows are paged separately
+ *  ([`rule_matches`], [`all_events`]) so scrolling never recomputes these.
+ */
 export type ResultPage = {
 	/**
 	 *  Every type in the case, unaffected by the window's type filter so the
@@ -224,8 +304,6 @@ export type ResultPage = {
 	first_day: string | null,
 	last_day: string | null,
 	groups: RuleGroup[],
-	matches: MatchRow[],
-	total_matches: number,
 	total_events: number,
 	matched_events: number,
 	/**  Events no rule matched. Shown so a coverage gap is visible, not hidden. */
@@ -234,6 +312,8 @@ export type ResultPage = {
 
 export type RuleGroup = {
 	rule_id: string,
+	/**  `meta: name`, or the id when the rule has none. */
+	name: string,
 	severity: string,
 	description: string,
 	match_count: number,
@@ -260,10 +340,22 @@ export type RuleHits = {
  */
 export type RuleOutline = {
 	rule_id: string,
+	/**  `meta: name`, or the id when the draft has none. */
+	name: string,
 	description: string,
 	severity: string,
 	/**  The condition rendered as a sentence. */
 	explanation: string,
+};
+
+/**
+ *  Why a draft does not parse, and where. `line` is what the editor marks
+ *  in the gutter; it is absent for errors that are not a place in the text
+ *  (a duplicate id, two rules in one draft).
+ */
+export type RuleProblem = {
+	message: string,
+	line: number | null,
 };
 
 /**

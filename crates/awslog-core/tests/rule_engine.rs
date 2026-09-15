@@ -166,6 +166,9 @@ fn shipped_rules_parse_and_are_scoped_to_their_log_types() {
             "{} lacks description",
             rule.id
         );
+        // The sidebar shows the name alone, so a shipped rule must not fall
+        // back to its id.
+        assert_ne!(rule.name(), rule.id, "{} lacks name", rule.id);
         assert_ne!(rule.severity(), "unknown", "{} lacks severity", rule.id);
         assert!(
             rule.meta.contains_key("log_type"),

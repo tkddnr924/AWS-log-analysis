@@ -111,6 +111,12 @@ impl Rule {
         self.meta.get("description").map_or("", String::as_str)
     }
 
+    /// `meta: name`, the label the sidebar shows; the id when absent so a
+    /// rule never renders as an empty row.
+    pub fn name(&self) -> &str {
+        self.meta.get("name").map_or(&self.id, String::as_str)
+    }
+
     /// `meta: log_type` restricts a rule to one log type; absent means any.
     pub fn applies_to(&self, log_type: &str) -> bool {
         self.meta

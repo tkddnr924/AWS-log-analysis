@@ -4,6 +4,7 @@
 rule alb_server_error
 {
     meta:
+        name        = "서버 오류 (5xx)"
         description = "ALB returned a server error"
         severity    = "medium"
         log_type    = "alb_access"
@@ -18,6 +19,7 @@ rule alb_server_error
 rule alb_forbidden_request
 {
     meta:
+        name        = "접근 거부 (403)"
         description = "ALB rejected a request with HTTP 403"
         severity    = "low"
         log_type    = "alb_access"
@@ -32,6 +34,7 @@ rule alb_forbidden_request
 rule alb_unusual_http_method
 {
     meta:
+        name        = "비정상 HTTP 메서드 (CONNECT·TRACE)"
         description = "ALB received an unusual proxy-oriented HTTP method"
         severity    = "high"
         log_type    = "alb_access"

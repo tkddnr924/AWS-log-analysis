@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { MappingEditor } from "./MappingEditor";
+import { FormatCard } from "./FormatCard";
 import { useApp } from "../state";
 import {
   formatBytes,
@@ -21,10 +21,11 @@ const STATUS_LABELS: Record<string, string> = {
   running: "진행 중",
 };
 
-type LogTab = "all" | (typeof PARSEABLE_LOG_TYPES)[number] | "other";
+type LogTab = (typeof PARSEABLE_LOG_TYPES)[number] | "other";
 
+/// One tab per type, no "every type" tab: the grid and the sample below it
+/// are read per type, and a mixed list has no single mapping to preview.
 const LOG_TABS: ReadonlyArray<{ id: LogTab; label: string }> = [
-  { id: "all", label: "전체" },
   ...PARSEABLE_LOG_TYPES.map((id) => ({ id, label: logTypeLabel(id) })),
   { id: "other", label: "기타" },
 ];
@@ -32,7 +33,6 @@ const LOG_TABS: ReadonlyArray<{ id: LogTab; label: string }> = [
 const FILE_BATCH_SIZE = 100;
 
 function belongsToTab(row: DetectionRow, tab: LogTab) {
-  if (tab === "all") return true;
   if (tab === "other") return !isParseableLogType(row.log_type);
   return row.log_type === tab;
 }
@@ -137,14 +137,16 @@ function Toolbar() {
 
 function FileReview() {
   const { rows, summary, selected } = useApp();
-  const [tab, setTab] = useState<LogTab>("all");
+  const tabCount = (id: LogTab) =>
+    rows.filter((row) => belongsToTab(row, id)).length;
+  // Opens on the first tab that has files; an empty first tab would show
+  // "no logs" for a directory that has plenty.
+  const [chosen, setTab] = useState<LogTab | null>(null);
+  const tab =
+    chosen ?? LOG_TABS.find(({ id }) => tabCount(id) > 0)?.id ?? LOG_TABS[0].id;
   if (!summary) return null;
 
   const visibleRows = rows.filter((row) => belongsToTab(row, tab));
-  const tabCount = (id: LogTab) =>
-    id === "all"
-      ? rows.length
-      : rows.filter((row) => belongsToTab(row, id)).length;
 
   return (
     <>
@@ -274,70 +276,16 @@ function FileGrid({ rows }: { rows: DetectionRow[] }) {
   );
 }
 
-/// One representative record. CloudTrail exposes its editable JSON mapping;
-/// ALB has a fixed positional schema, so its preview states that contract.
+/// The format card for one file of the tab: the first selected file, else
+/// the first one. Unrecognised files get the card too — seeing the first
+/// line is how one tells a Linux syslog from a mis-named export.
 function SamplePreview({ rows }: { rows: DetectionRow[] }) {
   const { selected } = useApp();
-  const source =
-    rows.find((row) => selected.has(row.display_path) && row.sample) ??
-    rows.find((row) => row.sample);
-  if (!source?.sample) return null;
-
-  const name = source.display_path.split("/").pop() ?? source.display_path;
-  const est = source.record_count_estimate;
-
-  return (
-    <section className="sample-panel">
-      <header>
-        <h2>{name}</h2>
-        <span className="muted small">대표 레코드</span>
-        <span className="grow" />
-        {est !== null && (
-          <span className="muted small">
-            전체 {est.toLocaleString()}개{source.estimated ? " 추정" : ""}
-          </span>
-        )}
-      </header>
-      {source.log_type !== "cloudtrail" ? (
-        <AlbSample sample={source.sample} />
-      ) : source.sample.raw ? (
-        <MappingEditor record={source.sample.raw} />
-      ) : null}
-    </section>
-  );
+  const source = rows.find((row) => selected.has(row.display_path)) ?? rows[0];
+  if (!source) return null;
+  return <FormatCard key={source.display_path} row={source} />;
 }
 
-function AlbSample({
-  sample,
-}: {
-  sample: NonNullable<DetectionRow["sample"]>;
-}) {
-  const fields = [
-    ["시간", sample.event_time],
-    ["서비스", sample.event_source],
-    ["소스 IP", sample.source_ip_address],
-  ].filter((field): field is [string, string] => field[1] !== null);
-
-  return (
-    <div className="alb-sample">
-      <dl>
-        {fields.map(([label, value]) => (
-          <div key={label}>
-            <dt>{label}</dt>
-            <dd title={value}>{value}</dd>
-          </div>
-        ))}
-      </dl>
-      <p>
-        고정 매핑 · 요청 메서드와 URL, ELB/대상 상태 코드, 처리 시간, 오류
-        사유를 정규화합니다.
-      </p>
-    </div>
-  );
-}
-
-/// `wide` fields get their own row: a real ARN is far longer than the rest
-/// and would otherwise push every other chip off the line.
 /// Past cases: a row per case with the id first, then where it came from and
 /// how big it is. Delete is a two-step action — the case holds the only copy
 /// of the parsed evidence.

@@ -45,6 +45,27 @@ fn parses_meta_fields_and_condition() {
 }
 
 #[test]
+fn payload_keys_with_hyphens_are_field_paths_not_subtraction() {
+    // S3 writes `x-amz-server-side-encryption`; the language has no
+    // arithmetic, so a hyphen inside a path is part of the name. A negative
+    // literal still parses: it always follows an operator.
+    let rules = parse_rules(
+        r#"rule sse {
+               fields: $e = response.x-amz-server-side-encryption == "AES256"
+                       $n = request.tagging.tagSet.0.key exists
+                       $neg = response.delta < -1
+               condition: $e and $n and $neg
+           }"#,
+    )
+    .unwrap();
+
+    let field = |var: &str| rules[0].fields.iter().find(|f| f.var == var).unwrap();
+    assert_eq!(field("$e").field, "response.x-amz-server-side-encryption");
+    assert_eq!(field("$n").field, "request.tagging.tagSet.0.key");
+    assert_eq!(field("$neg").op, Op::Lt);
+}
+
+#[test]
 fn keeps_dotted_paths_for_dynamic_fields() {
     let rules = parse_rules(SAMPLE).unwrap();
     let fail = rules[0].fields.iter().find(|f| f.var == "$fail").unwrap();
@@ -160,7 +181,7 @@ rule bad { fields: $a = event_name likes "a" condition: $a }
 "#;
     let err = parse_rules(src).unwrap_err();
     assert!(
-        matches!(&err, ParseRuleError::UnsupportedOp { rule, op } if rule == "bad" && op == "likes"),
+        matches!(&err, ParseRuleError::UnsupportedOp { rule, op, .. } if rule == "bad" && op == "likes"),
         "{err}"
     );
 }
@@ -169,6 +190,49 @@ rule bad { fields: $a = event_name likes "a" condition: $a }
 fn missing_condition_section_is_rejected() {
     let src = r#"rule bad { fields: $a = event_name == "a" }"#;
     assert!(parse_rules(src).is_err());
+}
+
+#[test]
+fn every_parse_error_names_the_line_it_happened_on() {
+    // The editor marks the line in the gutter; a message without a line
+    // would leave the analyst hunting through the text.
+    let line_of = |src: &str| parse_rules(src).unwrap_err().line();
+
+    // A condition missing its field: the error is where `==` is, line 4.
+    assert_eq!(
+        line_of("rule r {\n    meta: description = \"x\"\n    fields:\n        $n = == \"a\"\n    condition: $n\n}"),
+        Some(4)
+    );
+    // A field name where a variable should be, line 3.
+    assert_eq!(
+        line_of("rule r {\n    fields: $n = event_name == \"a\"\n    condition: event_name $n\n}"),
+        Some(3)
+    );
+    // An undefined variable: the line it is used on.
+    assert_eq!(
+        line_of("rule r {\n    fields: $n = event_name == \"a\"\n\n    condition:\n        $n and $missing\n}"),
+        Some(5)
+    );
+    // An unsupported operator word.
+    assert_eq!(
+        line_of("rule r {\n    fields: $n = event_name likes \"a\"\n    condition: $n\n}"),
+        Some(2)
+    );
+    // Input that ends early: the last line there is.
+    assert_eq!(
+        line_of("rule r {\n    fields: $n = event_name == \"a\"\n"),
+        Some(2)
+    );
+    // The lexer already knew its line.
+    assert_eq!(
+        line_of("rule r {\n    fields: $n = event_name ~= \"a\"\n    condition: $n\n}"),
+        Some(2)
+    );
+    // Not a place in the text.
+    assert_eq!(
+        line_of("rule d { fields: $a = event_name == \"a\" condition: $a }\nrule d { fields: $a = event_name == \"a\" condition: $a }"),
+        None
+    );
 }
 
 #[test]

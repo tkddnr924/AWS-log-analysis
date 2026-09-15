@@ -8,7 +8,7 @@ import {
   type RuleSource,
   type Window,
 } from "./bindings";
-import { RecordFields } from "./panels/RecordView";
+import { RawRecord, RecordFields } from "./panels/RecordView";
 import { RuleEditor } from "./panels/RuleEditor";
 import { logTypeLabel } from "./lib/format";
 import { useApp } from "./state";
@@ -46,8 +46,10 @@ export function Results({ caseId }: { caseId: string }) {
   const { reset, go, work } = useApp();
   const [page, setPage] = useState<ResultPage | null>(null);
   const [selected, setSelected] = useState<string>(ALL_EVENTS);
-  // One `files.log_type`, or null for the whole case. Scopes the rule list,
-  // the counts and the event list alike.
+  // One `files.log_type`. Scopes the rule list, the counts and the event
+  // list alike. There is no "every type" view: a mixed list has no column
+  // set that fits, and each query would span the whole case. Null only
+  // until the case's types are known (or when it has none).
   const [logType, setLogType] = useState<string | null>(null);
   // KST bounds typed as text: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM` or
   // `YYYY-MM-DD HH:MM:SS`, both inclusive at their unit; "" is open. Ranks
@@ -84,9 +86,7 @@ export function Results({ caseId }: { caseId: string }) {
   const [editing, setEditing] = useState<{ ruleId: string | null } | null>(
     null,
   );
-  // Destructive action is confirmed in the row it affects. A global minus
-  // button made it too easy to delete whichever rule happened to be selected.
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
   // A rule being evaluated over the case right now. It opens the same
   // database read-write; paging meanwhile risks a DuckDB lock error, and a
   // second evaluation would be refused by the backend, so the list holds.
@@ -114,7 +114,7 @@ export function Results({ caseId }: { caseId: string }) {
   const [newestFirst, setNewestFirst] = useState(false);
   const [raw, setRaw] = useState<{
     eventId: number;
-    body: string;
+    body: string | null;
     fields: FieldPreview[];
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -141,11 +141,13 @@ export function Results({ caseId }: { caseId: string }) {
     // groups and could reset a valid selection.
     let stale = false;
     // No search here: the sidebar counts describe each rule, not the filter.
-    commands.queryResults(caseId, null, pageWindow(0, "", false)).then((r) => {
+    commands.queryResults(caseId, pageWindow(0, "", false)).then((r) => {
       if (stale) return;
       if (r.status === "error") return fail(r.error);
       setFilterError(null);
       setPage(r.data);
+      // The first type is the opening tab; the rows wait for it.
+      setLogType((t) => t ?? r.data.log_types[0]?.log_type ?? null);
       // The evaluation this reload was waiting for is visible now.
       setEvaluating((id) =>
         id && r.data.groups.some((g) => g.rule_id === id && !g.evaluated)
@@ -164,6 +166,10 @@ export function Results({ caseId }: { caseId: string }) {
       stale = true;
     };
   }, [caseId, version, logType, from, to]);
+
+  // Rows are queried once the tab is known: before that the case's types
+  // are still on the way, and a page over every type would be discarded.
+  const rowsReady = logType !== null || (page?.log_types.length ?? 1) === 0;
 
   // A full-text scan per keystroke would stall on a large case, so the typed
   // value settles first.
@@ -207,30 +213,34 @@ export function Results({ caseId }: { caseId: string }) {
     setMatches([]);
     setRowsLoading(true);
     const run = ++generation.current;
-    if (selected === ALL_EVENTS) {
-      commands
-        .queryEvents(caseId, pageWindow(0, search, newestFirst))
-        .then((r) => {
-          if (run !== generation.current) return;
-          setRowsLoading(false);
-          if (r.status === "error") return fail(r.error);
-          setFilterError(null);
-          setMatches(r.data.rows);
-          setTotal(r.data.total);
-        });
-      return;
-    }
-    commands
-      .queryResults(caseId, selected, pageWindow(0, search, newestFirst))
-      .then((r) => {
-        if (run !== generation.current) return;
-        setRowsLoading(false);
-        if (r.status === "error") return fail(r.error);
-        setFilterError(null);
-        setMatches(r.data.matches);
-        setTotal(r.data.total_matches);
-      });
-  }, [caseId, selected, version, search, newestFirst, logType, from, to]);
+    if (!rowsReady) return;
+    const request =
+      selected === ALL_EVENTS
+        ? commands.queryEvents(caseId, pageWindow(0, search, newestFirst))
+        : commands.queryRuleMatches(
+            caseId,
+            selected,
+            pageWindow(0, search, newestFirst),
+          );
+    request.then((r) => {
+      if (run !== generation.current) return;
+      setRowsLoading(false);
+      if (r.status === "error") return fail(r.error);
+      setFilterError(null);
+      setMatches(r.data.rows);
+      setTotal(r.data.total);
+    });
+  }, [
+    caseId,
+    selected,
+    version,
+    search,
+    newestFirst,
+    logType,
+    rowsReady,
+    from,
+    to,
+  ]);
 
   // Paging, not one huge payload: the backend caps each page at 1000 rows.
   // The in-flight guard matters: the virtualizer fires this on every render
@@ -255,7 +265,7 @@ export function Results({ caseId }: { caseId: string }) {
               caseId,
               pageWindow(offset, search, newestFirst),
             )
-          : await commands.queryResults(
+          : await commands.queryRuleMatches(
               caseId,
               selected,
               pageWindow(offset, search, newestFirst),
@@ -265,10 +275,9 @@ export function Results({ caseId }: { caseId: string }) {
       // interleave two different queries.
       if (run !== generation.current) return;
       if (rows.status === "error") return fail(rows.error);
-      const next = "rows" in rows.data ? rows.data.rows : rows.data.matches;
       // Offset was captured before the await; ignore a stale response.
       setMatches((prev) =>
-        prev.length === offset ? [...prev, ...next] : prev,
+        prev.length === offset ? [...prev, ...rows.data.rows] : prev,
       );
     } finally {
       loading.current = false;
@@ -311,12 +320,12 @@ export function Results({ caseId }: { caseId: string }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [raw]);
 
-  async function removeRule(ruleId: string) {
+  async function removeRule(ruleId: string): Promise<string | null> {
     const r = await commands.deleteRule(caseId, ruleId);
-    setConfirmDelete(null);
-    if (r.status === "error") return setError(r.error);
+    if (r.status === "error") return r.error;
     setSelected(ALL_EVENTS);
     setVersion((v) => v + 1);
+    return null;
   }
 
   /// The detail view resolves the record through the same mapping the parse
@@ -325,14 +334,7 @@ export function Results({ caseId }: { caseId: string }) {
     opener.current = from ?? null;
     const r = await commands.getRawRecord(caseId, eventId);
     if (r.status === "error") return setError(r.error);
-    let body = "(원본이 저장되지 않음)";
-    if (r.data) {
-      try {
-        body = JSON.stringify(JSON.parse(r.data), null, 2);
-      } catch {
-        body = r.data;
-      }
-    }
+    const body = r.data;
     // Stored columns, not the raw record re-resolved: this case was parsed
     // with its own mapping (snapshotted in the case), and the editor's
     // mapping belongs to the next run.
@@ -362,22 +364,10 @@ export function Results({ caseId }: { caseId: string }) {
         </button>
       </header>
 
-      {/* Types come from the case, so a new parser adds its own tab. */}
+      {/* Types come from the case, so a new parser adds its own tab. One is
+          always selected: the rules, counts and columns are all per type. */}
       {page.log_types.length > 0 && (
         <nav className="log-tabs" role="tablist" aria-label="로그 타입">
-          <button
-            role="tab"
-            aria-selected={logType === null}
-            className={logType === null ? "active" : ""}
-            onClick={() => setLogType(null)}
-          >
-            전체
-            <span>
-              {page.log_types
-                .reduce((sum, t) => sum + t.events, 0)
-                .toLocaleString()}
-            </span>
-          </button>
           {page.log_types.map((t) => (
             <button
               key={t.log_type}
@@ -481,14 +471,11 @@ export function Results({ caseId }: { caseId: string }) {
             <li className={selected === ALL_EVENTS ? "active" : ""}>
               <button
                 className="rule-select all-events"
-                onClick={() => {
-                  setConfirmDelete(null);
-                  setSelected(ALL_EVENTS);
-                }}
+                onClick={() => setSelected(ALL_EVENTS)}
               >
                 <span className="rule-label">
                   <span className="rule-marker overview" aria-hidden="true" />
-                  <span className="rule-id">전체 이벤트</span>
+                  <span className="rule-name">전체 이벤트</span>
                 </span>
                 <span className="hits">
                   {page.total_events.toLocaleString()}건
@@ -503,31 +490,21 @@ export function Results({ caseId }: { caseId: string }) {
                 user={sources[group.rule_id]?.user ?? false}
                 evaluating={evaluating === group.rule_id}
                 failed={failed?.ruleId === group.rule_id}
-                confirmingDelete={confirmDelete === group.rule_id}
                 busy={reevaluating}
                 onSelect={() => {
-                  setConfirmDelete(null);
                   // A click is the explicit retry after a failed evaluation.
                   setFailed((f) => (f?.ruleId === group.rule_id ? null : f));
                   setSelected(group.rule_id);
                 }}
-                onEdit={() => {
-                  setConfirmDelete(null);
-                  setEditing({ ruleId: group.rule_id });
-                }}
-                onAskDelete={() => {
-                  setSelected(group.rule_id);
-                  setConfirmDelete(group.rule_id);
-                }}
-                onCancelDelete={() => setConfirmDelete(null)}
-                onDelete={() => void removeRule(group.rule_id)}
+                onEdit={() => setEditing({ ruleId: group.rule_id })}
               />
             ))}
           </ul>
           {failed && (
             <p className="error small rule-error" role="alert">
-              {failed.ruleId} 평가 실패: {failed.error} — 룰을 다시 클릭하면
-              재시도합니다.
+              {page.groups.find((g) => g.rule_id === failed.ruleId)?.name ??
+                failed.ruleId}{" "}
+              평가 실패: {failed.error} — 룰을 다시 클릭하면 재시도합니다.
             </p>
           )}
         </div>
@@ -540,7 +517,7 @@ export function Results({ caseId }: { caseId: string }) {
           searchLabel={
             selected === ALL_EVENTS
               ? "전체 이벤트에서 검색"
-              : `${selected} 결과에서 검색`
+              : `${page.groups.find((g) => g.rule_id === selected)?.name ?? selected} 결과에서 검색`
           }
           newestFirst={newestFirst}
           onToggleSort={() => setNewestFirst((v) => !v)}
@@ -549,7 +526,7 @@ export function Results({ caseId }: { caseId: string }) {
           viewKey={`${selected}\u0000${search}\u0000${newestFirst}\u0000${logType}\u0000${from}\u0000${to}`}
           evaluating={evaluating === selected}
           loading={rowsLoading}
-          layout={layoutFor(logType, page.log_types)}
+          layout={layoutFor(logType)}
           onLoadMore={loadMore}
           onShowRaw={showRaw}
         />
@@ -558,6 +535,7 @@ export function Results({ caseId }: { caseId: string }) {
       {editing && (
         <RuleEditor
           caseId={caseId}
+          logType={logType}
           initial={
             editing.ruleId ? (sources[editing.ruleId]?.source ?? "") : ""
           }
@@ -570,6 +548,17 @@ export function Results({ caseId }: { caseId: string }) {
             setVersion((v) => v + 1);
             return null;
           }}
+          // Only an existing rule can be deleted; the editor decides how
+          // to ask. A shipped rule leaves this case, a user rule leaves
+          // the disk (docs/04).
+          onDelete={
+            editing.ruleId
+              ? {
+                  user: sources[editing.ruleId]?.user ?? false,
+                  run: () => removeRule(editing.ruleId!),
+                }
+              : undefined
+          }
         />
       )}
 
@@ -590,7 +579,9 @@ export function Results({ caseId }: { caseId: string }) {
             onClick={(e) => e.stopPropagation()}
           >
             <header>
-              <h2>이벤트 상세 #{raw.eventId}</h2>
+              <h2>
+                이벤트 상세<code>#{raw.eventId}</code>
+              </h2>
               <span className="grow" />
               <button ref={closeRaw} onClick={() => setRaw(null)}>
                 닫기
@@ -603,10 +594,7 @@ export function Results({ caseId }: { caseId: string }) {
             )}
             {/* The raw record stays available but folded: it is the fallback
                 for anything the mapping does not name. */}
-            <details className="raw-json">
-              <summary>원본 JSON</summary>
-              <pre>{raw.body}</pre>
-            </details>
+            <RawRecord text={raw.body} />
           </aside>
         </div>
       )}
@@ -614,136 +602,73 @@ export function Results({ caseId }: { caseId: string }) {
   );
 }
 
+/// One rule in the sidebar. `meta: name` is the label (the id when the rule
+/// has none); the id itself is only in the tooltip. The only action here is
+/// edit; deleting lives in the editor, next to what is being deleted.
 function RuleItem({
   group,
   active,
   user,
   evaluating,
   failed,
-  confirmingDelete,
   busy,
   onSelect,
   onEdit,
-  onAskDelete,
-  onCancelDelete,
-  onDelete,
 }: {
   group: RuleGroup;
   active: boolean;
-  /// From `cases/rules/`: deleting removes the file. A shipped rule is only
-  /// removed from this case.
+  /// From `cases/rules/`, i.e. written or overridden by the analyst.
   user: boolean;
   evaluating: boolean;
   failed: boolean;
-  confirmingDelete: boolean;
   busy: boolean;
   onSelect: () => void;
   onEdit: () => void;
-  onAskDelete: () => void;
-  onCancelDelete: () => void;
-  onDelete: () => void;
 }) {
+  const label = group.name;
   return (
     <li className={active ? "active" : ""}>
       <button
         className="rule-select"
         onClick={onSelect}
-        title={user ? group.description : `기본 제공 룰 · ${group.description}`}
+        title={
+          user ? `사용자 룰 · ${group.rule_id}` : `기본 룰 · ${group.rule_id}`
+        }
       >
         <span className="rule-label">
           <span
             className={`rule-marker severity-${group.severity}`}
             aria-hidden="true"
           />
-          <span className="rule-id">{group.rule_id}</span>
+          <span className="rule-name">{label}</span>
+          {user && <em className="rule-owner">사용자</em>}
         </span>
         {/* No count on the row: the list under the table carries it. */}
         {evaluating ? (
           <span
             className="rule-spinner"
             role="status"
-            aria-label={`${group.rule_id} 평가 중`}
+            aria-label={`${label} 평가 중`}
           />
         ) : failed ? (
           <span className="hits pending failed">실패 · 재시도</span>
         ) : null}
       </button>
-      {
-        <div
-          className={`rule-actions${confirmingDelete ? " confirming" : ""}`}
-          aria-busy={busy}
+      <div className="rule-actions" aria-busy={busy}>
+        <button
+          className="edit"
+          aria-label={`${label} 수정`}
+          title="룰 수정"
+          onClick={onEdit}
+          disabled={busy}
         >
-          {confirmingDelete ? (
-            <>
-              <button
-                className="cancel"
-                aria-label={`${group.rule_id} 삭제 취소`}
-                title="삭제 취소"
-                onClick={onCancelDelete}
-                disabled={busy}
-              >
-                <RuleActionIcon name="cancel" />
-              </button>
-              <button
-                className="danger"
-                aria-label={`${group.rule_id} 삭제 확인`}
-                title={busy ? "삭제 중" : "삭제 확인"}
-                onClick={onDelete}
-                disabled={busy}
-              >
-                <RuleActionIcon name="delete" />
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                className="edit"
-                aria-label={`${group.rule_id} 수정`}
-                title="룰 수정"
-                onClick={onEdit}
-                disabled={busy}
-              >
-                <RuleActionIcon name="edit" />
-              </button>
-              <button
-                className="delete"
-                aria-label={`${group.rule_id} 삭제`}
-                title={user ? "룰 삭제" : "이 케이스에서 룰 제거"}
-                onClick={onAskDelete}
-                disabled={busy}
-              >
-                <RuleActionIcon name="delete" />
-              </button>
-            </>
-          )}
-        </div>
-      }
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" />
+          </svg>
+        </button>
+      </div>
     </li>
-  );
-}
-
-/// Small line icons keep the row compact; the surrounding button owns the
-/// accessible label, so the SVG itself stays out of the accessibility tree.
-function RuleActionIcon({ name }: { name: "edit" | "delete" | "cancel" }) {
-  if (name === "edit") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="M12 20h9" />
-        <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" />
-      </svg>
-    );
-  }
-  if (name === "cancel") {
-    return (
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <path d="m6 6 12 12M18 6 6 18" />
-      </svg>
-    );
-  }
-  return (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" />
-    </svg>
   );
 }
 
@@ -762,16 +687,12 @@ type EventTone = "read" | "change" | "danger" | "identity";
 
 /// Column set for the match list. ALB rows are HTTP requests and read as
 /// method/status/URL; CloudTrail rows are API calls and read as
-/// event/service/principal. A mixed list falls back to the CloudTrail set,
-/// which every row can fill.
+/// event/service/principal. The tab names the type; a case with none
+/// (nothing parsed) gets the CloudTrail set, which every row can fill.
 type Layout = "http" | "waf" | "cloudtrail";
 
-function layoutFor(
-  tab: string | null,
-  present: { log_type: string }[],
-): Layout {
-  const only = tab ?? (present.length === 1 ? present[0].log_type : null);
-  switch (only) {
+function layoutFor(tab: string | null): Layout {
+  switch (tab) {
     case "alb_access":
     case "apigw_access":
     case "nginx_access":

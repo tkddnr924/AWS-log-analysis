@@ -26,7 +26,10 @@ fn event() -> NormalizedEvent {
         read_only: Some(false),
         management_event: Some(true),
         request: Some(r#"{"durationSeconds":7200}"#.into()),
-        response: Some(r#"{"ConsoleLogin":"Failure"}"#.into()),
+        response: Some(
+            r#"{"ConsoleLogin":"Failure","x-amz-server-side-encryption":"AES256","delta":-3}"#
+                .into(),
+        ),
         resources: None,
         raw: Some(r#"{"eventName":"ConsoleLogin"}"#.into()),
     }
@@ -54,6 +57,19 @@ fn equality_and_negation_compare_normalized_fields() {
     assert!(matches(
         &rule(r#"fields: $a = event_name != "AssumeRole" condition: $a"#),
         &event()
+    ));
+}
+
+#[test]
+fn hyphenated_payload_keys_resolve_like_any_other_path() {
+    let e = event();
+    assert!(matches(
+        &rule(r#"fields: $s = response.x-amz-server-side-encryption == "AES256" condition: $s"#),
+        &e
+    ));
+    assert!(matches(
+        &rule(r#"fields: $d = response.delta < -1 condition: $d"#),
+        &e
     ));
 }
 

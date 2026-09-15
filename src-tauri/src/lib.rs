@@ -9,7 +9,7 @@ use awslog_core::mapping::{Field, FieldMap};
 use awslog_core::parse::{self, ParseOptions};
 use awslog_core::paths::{self, CasesRoot, RootSources};
 use awslog_core::report::{self, DetectionRow, ScanSummary};
-use awslog_core::results::{self, ResultPage, ResultQuery};
+use awslog_core::results::{self, ResultPage};
 use awslog_core::rule::RuleSet;
 use awslog_core::scan;
 use awslog_core::store::{CaseStatus, Store};
@@ -330,6 +330,33 @@ fn preview_mapping(
         .collect())
 }
 
+/// FR-4: the head of one detected file as pieces with the column each one
+/// feeds, under the editor's current mapping (docs/03 "포맷 카드").
+/// `display_path` is the detection row's path, relative to `root`.
+#[tauri::command]
+#[specta::specta]
+async fn preview_head(
+    root: String,
+    display_path: String,
+    log_type: String,
+    mapping: Vec<MappingEntry>,
+) -> Result<awslog_core::preview::HeadPreview, String> {
+    let root = PathBuf::from(root);
+    let path = root.join(&display_path);
+    // The row came from scanning `root`; anything else is not ours to read.
+    if display_path.split('/').any(|part| part == "..") || !path.starts_with(&root) {
+        return Err(format!("파일이 스캔한 폴더 밖입니다: {display_path}"));
+    }
+    let log_type = awslog_core::detect::LogType::parse(&log_type)
+        .ok_or_else(|| format!("알 수 없는 로그 타입: {log_type}"))?;
+    let map = build_map(&mapping);
+    tauri::async_runtime::spawn_blocking(move || {
+        awslog_core::preview::preview_head(&path, log_type, &map).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// One resolved field: `None` means no source path matched.
 #[derive(Clone, serde::Serialize, specta::Type)]
 struct FieldPreview {
@@ -531,43 +558,95 @@ fn evaluate_rule_in(state: &AppState, case_id: &str, rule_id: &str) -> Result<u6
     results::evaluate_rule(&mut store, rule).map_err(|e| e.to_string())
 }
 
-/// Lists rule groups and one page of matches for a case. The window's search
-/// narrows the selected rule's matches only; its log type and date range
-/// narrow everything, group counts included.
+/// Lists rule groups and totals for a case. The window's log type and date
+/// range narrow everything, group counts included; its search is ignored.
+/// Rows are paged by `query_rule_matches` and `query_events`, so scrolling
+/// never repeats the case-level scans this does.
 #[tauri::command]
 #[specta::specta]
 async fn query_results(
     state: tauri::State<'_, AppState>,
     case_id: String,
-    rule_id: Option<String>,
     window: results::Window,
 ) -> Result<ResultPage, String> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let case_dir = state
-            .cases_root
-            .case_dir(&case_id)
-            .ok_or_else(|| format!("invalid case id: {case_id}"))?;
-        let mut store = state.store(&case_id)?;
-        // Cases recorded before `rules.log_type` existed: fill it from the
-        // rule snapshot so the sidebar can scope rules without re-evaluating.
-        // Older cases may have no snapshot either; the current rules are the
-        // next best description of what was evaluated.
-        if store.rules_lack_log_type().map_err(|e| e.to_string())? {
-            let candidates = [
-                RuleSet::load_dir(&case_dir.join("rules")),
-                RuleSet::load_layered(&state.cases_root.user_rules_dir()),
-            ];
-            for set in candidates.into_iter().flatten() {
-                store
-                    .backfill_rule_log_types(set.rules())
-                    .map_err(|e| e.to_string())?;
-                if !store.rules_lack_log_type().map_err(|e| e.to_string())? {
-                    break;
-                }
+    tauri::async_runtime::spawn_blocking(move || query_results_in(&state, &case_id, &window))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn query_results_in(
+    state: &AppState,
+    case_id: &str,
+    window: &results::Window,
+) -> Result<ResultPage, String> {
+    let case_dir = state
+        .cases_root
+        .case_dir(case_id)
+        .ok_or_else(|| format!("invalid case id: {case_id}"))?;
+    let mut store = state.store(case_id)?;
+    // Cases recorded before `rules.log_type` / `rules.name` existed: fill
+    // them from the rule snapshot so the sidebar can scope and label rules
+    // without re-evaluating. Older cases may have no snapshot either; the
+    // current rules are the next best description of what was evaluated.
+    let lacking = |store: &Store| -> Result<bool, String> {
+        Ok(store.rules_lack_log_type().map_err(|e| e.to_string())?
+            || store.rules_lack_name().map_err(|e| e.to_string())?)
+    };
+    if lacking(&store)? {
+        let candidates = [
+            RuleSet::load_dir(&case_dir.join("rules")),
+            RuleSet::load_layered(&state.cases_root.user_rules_dir()),
+        ];
+        for set in candidates.into_iter().flatten() {
+            store
+                .backfill_rule_log_types(set.rules())
+                .map_err(|e| e.to_string())?;
+            store
+                .backfill_rule_names(set.rules())
+                .map_err(|e| e.to_string())?;
+            if !lacking(&store)? {
+                break;
             }
         }
-        results::query(&store, &ResultQuery { rule_id, window }).map_err(|e| e.to_string())
+    }
+    results::query(&store, window).map_err(|e| e.to_string())
+}
+
+/// One page of a rule's matches. Served from the match table alone, so a
+/// page costs the same on a 300M-event case as on a small one.
+#[tauri::command]
+#[specta::specta]
+async fn query_rule_matches(
+    state: tauri::State<'_, AppState>,
+    case_id: String,
+    rule_id: String,
+    window: results::Window,
+) -> Result<results::EventPage, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = state.store(&case_id)?;
+        results::rule_matches(&store, &rule_id, &window).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The payload paths a case's events hold (`request.*`, `response.*`,
+/// `resources.*`), counted while parsing, so the rule editor can offer what
+/// the data has instead of a fixed field list. `log_type` narrows to the
+/// tab being looked at.
+#[tauri::command]
+#[specta::specta]
+async fn list_payload_keys(
+    state: tauri::State<'_, AppState>,
+    case_id: String,
+    log_type: Option<String>,
+) -> Result<Vec<results::PayloadKey>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = state.store(&case_id)?;
+        results::payload_keys(&store, log_type.as_deref()).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -730,24 +809,42 @@ fn delete_rule_in(state: &AppState, case_id: &str, rule_id: &str) -> Result<(), 
 /// What a draft rule says, in words, plus its id and metadata. The editor
 /// shows this beside the source so intent can be checked without re-reading
 /// the syntax.
-#[derive(Clone, serde::Serialize, specta::Type)]
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
 struct RuleOutline {
     rule_id: String,
+    /// `meta: name`, or the id when the draft has none.
+    name: String,
     description: String,
     severity: String,
     /// The condition rendered as a sentence.
     explanation: String,
 }
 
+/// Why a draft does not parse, and where. `line` is what the editor marks
+/// in the gutter; it is absent for errors that are not a place in the text
+/// (a duplicate id, two rules in one draft).
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+struct RuleProblem {
+    message: String,
+    line: Option<u32>,
+}
+
 #[tauri::command]
 #[specta::specta]
-fn explain_rule(source: String) -> Result<RuleOutline, String> {
-    let set = RuleSet::from_source(&source).map_err(|e| e.to_string())?;
+fn explain_rule(source: String) -> Result<RuleOutline, RuleProblem> {
+    let set = RuleSet::from_source(&source).map_err(|e| RuleProblem {
+        message: e.to_string(),
+        line: e.line().map(|l| l as u32),
+    })?;
     let [rule] = set.rules() else {
-        return Err("한 번에 룰 하나만 편집할 수 있습니다".to_owned());
+        return Err(RuleProblem {
+            message: "한 번에 룰 하나만 편집할 수 있습니다".to_owned(),
+            line: None,
+        });
     };
     Ok(RuleOutline {
         rule_id: rule.id.clone(),
+        name: rule.name().to_owned(),
         description: rule.description().to_owned(),
         severity: rule.severity().to_owned(),
         explanation: awslog_core::rule::explain(rule),
@@ -977,6 +1074,9 @@ pub fn run() {
             start_parse,
             cancel_parse,
             query_results,
+            query_rule_matches,
+            list_payload_keys,
+            preview_head,
             get_raw_record,
             list_cases,
             delete_case,
@@ -1063,10 +1163,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_mapping, delete_case_in, delete_rule_in, evaluate_rule_in, fit_window, paths,
-        preview_mapping, save_rule_in, user_rule_path, write_user_rule, AppState, Arc, CasesRoot,
-        Field, FieldPreview, MappingEntry, OffsetDateTime, ParseSlot, Path, PrimitiveDateTime,
-        Store, StoreCache, MIN_WINDOW,
+        default_mapping, delete_case_in, delete_rule_in, evaluate_rule_in, explain_rule,
+        fit_window, paths, preview_mapping, query_results_in, results, save_rule_in,
+        user_rule_path, write_user_rule, AppState, Arc, CasesRoot, Field, FieldPreview,
+        MappingEntry, OffsetDateTime, ParseSlot, Path, PrimitiveDateTime, RuleSet, Store,
+        StoreCache, MIN_WINDOW,
     };
     use std::sync::atomic::Ordering;
 
@@ -1158,6 +1259,22 @@ mod tests {
     #[test]
     fn a_malformed_record_is_reported_not_panicked_on() {
         assert!(preview_mapping("{not json".to_owned(), vec![]).is_err());
+    }
+
+    #[test]
+    fn a_broken_draft_is_explained_with_the_line_it_breaks_on() {
+        let draft = "rule r {\n    fields:\n        $n = \"ConsoleLogin\"\n    condition:\n        event_name $n\n}";
+        let problem = explain_rule(draft.to_owned()).unwrap_err();
+        assert_eq!(problem.line, Some(3));
+        assert!(
+            problem.message.contains("expected a field name"),
+            "{}",
+            problem.message
+        );
+
+        // Two rules in one draft is a property of the draft, not a line.
+        let two = "rule a { fields: $n = event_name exists condition: $n }\nrule b { fields: $n = event_name exists condition: $n }";
+        assert_eq!(explain_rule(two.to_owned()).unwrap_err().line, None);
     }
 
     #[test]
@@ -1263,6 +1380,44 @@ mod tests {
             .unwrap();
         assert!(groups[0].evaluated);
         assert_eq!(groups[0].match_count, 1);
+    }
+
+    #[test]
+    fn an_older_case_shows_shipped_rule_names_from_the_current_pack() {
+        // A case parsed before `rules.name` existed holds NULL names and a
+        // snapshot without `meta: name`. The sidebar must still show names,
+        // taken from the pack in this binary, without re-evaluating.
+        let (_tmp, state, case_id) = seeded_case();
+        {
+            let store = state.store(&case_id).unwrap();
+            let old_pack = RuleSet::from_source(
+                r#"rule alb_server_error {
+                       meta: description = "old" severity = "medium" log_type = "alb_access"
+                       fields: $s = response.elb_status_code >= 500
+                       condition: $s
+                   }"#,
+            )
+            .unwrap();
+            store
+                .writer_handle()
+                .unwrap()
+                .begin_rule_run(old_pack.rules())
+                .unwrap();
+        }
+
+        let page = query_results_in(
+            &state,
+            &case_id,
+            &results::Window {
+                log_type: Some("alb_access".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.groups[0].rule_id, "alb_server_error");
+        assert_eq!(page.groups[0].name, "서버 오류 (5xx)");
     }
 
     #[test]

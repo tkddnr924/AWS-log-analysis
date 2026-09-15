@@ -38,17 +38,11 @@ impl Window {
     }
 }
 
-/// What the results window is asking for.
-#[derive(Debug, Clone, Default)]
-pub struct ResultQuery {
-    /// `None` lists rule groups only; `Some` also pages that rule's matches.
-    pub rule_id: Option<String>,
-    pub window: Window,
-}
-
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct RuleGroup {
     pub rule_id: String,
+    /// `meta: name`, or the id when the rule has none.
+    pub name: String,
     pub severity: String,
     pub description: String,
     #[specta(type = u32)]
@@ -97,6 +91,9 @@ pub struct LogTypeCount {
     pub events: u64,
 }
 
+/// The results sidebar: type tabs, date bounds, rule groups and the case
+/// totals under the window's scope. Rows are paged separately
+/// ([`rule_matches`], [`all_events`]) so scrolling never recomputes these.
 #[derive(Debug, Clone, Serialize, Type, Default)]
 pub struct ResultPage {
     /// Every type in the case, unaffected by the window's type filter so the
@@ -107,9 +104,6 @@ pub struct ResultPage {
     pub first_day: Option<String>,
     pub last_day: Option<String>,
     pub groups: Vec<RuleGroup>,
-    pub matches: Vec<MatchRow>,
-    #[specta(type = u32)]
-    pub total_matches: u64,
     #[specta(type = u32)]
     pub total_events: u64,
     #[specta(type = u32)]
@@ -119,48 +113,68 @@ pub struct ResultPage {
     pub unmatched_events: u64,
 }
 
-/// Runs one results query against a parsed case.
+/// Lists the rule groups and totals of a parsed case.
 ///
 /// Everything comes from the case database, including rule metadata, so a
-/// copied case renders identically without its rule files.
-pub fn query(store: &Store, request: &ResultQuery) -> Result<ResultPage, StoreError> {
-    let window = &request.window;
+/// copied case renders identically without its rule files. The window's
+/// search is ignored: the sidebar describes the rules, not a filtered list.
+pub fn query(store: &Store, window: &Window) -> Result<ResultPage, StoreError> {
     let (first_day, last_day) = store.day_span()?;
-    let mut page = ResultPage {
+    let total_events = store.event_count(window)?;
+    let matched_events = store.matched_event_count(window)?;
+    Ok(ResultPage {
         log_types: store.log_type_counts()?,
         first_day,
         last_day,
         groups: store.rule_groups(window)?,
-        total_events: store.event_count(window)?,
-        ..Default::default()
-    };
-
-    page.matched_events = store.matched_event_count(window)?;
-    page.unmatched_events = page.total_events.saturating_sub(page.matched_events);
-
-    if let Some(rule_id) = &request.rule_id {
-        // The filtered count, not the group's: the number under the table
-        // describes the list the analyst is looking at. The sidebar keeps the
-        // rule's real hit count.
-        page.total_matches = store.rule_match_count(rule_id, &request.window)?;
-        page.matches = store.rule_matches(rule_id, &request.window)?;
-    }
-
-    Ok(page)
+        total_events,
+        matched_events,
+        unmatched_events: total_events.saturating_sub(matched_events),
+    })
 }
 
-/// One page of the all-events view, with the total that page was drawn from.
+/// One page of rows, with the total that page was drawn from.
 #[derive(Debug, Clone, Serialize, Type, Default)]
 pub struct EventPage {
     pub rows: Vec<MatchRow>,
-    /// Events matching the filter. Paging needs this, or the list stops short
+    /// Rows matching the filter. Paging needs this, or the list stops short
     /// of the filtered set or asks for pages that do not exist.
     #[specta(type = u32)]
     pub total: u64,
 }
 
-/// Pages every event regardless of rules. Separate from `query` because the
-/// group list and totals do not change as the user scrolls.
+/// Pages one rule's matches. The total is the filtered count: the number
+/// under the table describes the list the analyst is looking at, while the
+/// sidebar group keeps the rule's real hit count.
+pub fn rule_matches(
+    store: &Store,
+    rule_id: &str,
+    window: &Window,
+) -> Result<EventPage, StoreError> {
+    Ok(EventPage {
+        rows: store.rule_matches(rule_id, window)?,
+        total: store.rule_match_count(rule_id, window)?,
+    })
+}
+
+/// One JSON path seen inside a payload column while parsing, and how many
+/// events of that log type carried it (docs/04 "페이로드 키").
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct PayloadKey {
+    pub log_type: String,
+    /// As a rule spells it: `request.bucketName`, `resources.0.ARN`.
+    pub path: String,
+    #[specta(type = u32)]
+    pub events: u64,
+}
+
+/// The payload paths a case holds, for the rule editor. `log_type` narrows
+/// to the tab being looked at; `None` lists every type.
+pub fn payload_keys(store: &Store, log_type: Option<&str>) -> Result<Vec<PayloadKey>, StoreError> {
+    store.payload_keys(log_type)
+}
+
+/// Pages every event regardless of rules.
 pub fn all_events(store: &Store, window: &Window) -> Result<EventPage, StoreError> {
     Ok(EventPage {
         rows: store.all_events(window)?,

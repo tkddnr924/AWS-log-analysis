@@ -2,27 +2,70 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::lex::{tokenize, tokenize_spanned, LexError, Token};
+use super::lex::{tokenize_spanned, LexError, Token};
 use super::{Condition, FieldCondition, Literal, Op, Rule};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseRuleError {
     #[error("rule syntax error: {0}")]
     Lex(#[from] LexError),
-    #[error("rule `{rule}`: {message}")]
-    Syntax { rule: String, message: String },
+    #[error("line {line}: rule `{rule}`: {message}")]
+    Syntax {
+        rule: String,
+        line: usize,
+        message: String,
+    },
     #[error("duplicate rule id `{id}`")]
     DuplicateId { id: String },
-    #[error("rule `{rule}`: condition uses undefined variable `{var}`")]
-    UndefinedVar { rule: String, var: String },
-    #[error("rule `{rule}`: unsupported operator `{op}`")]
-    UnsupportedOp { rule: String, op: String },
+    #[error("line {line}: rule `{rule}`: condition uses undefined variable `{var}`")]
+    UndefinedVar {
+        rule: String,
+        line: usize,
+        var: String,
+    },
+    #[error("line {line}: rule `{rule}`: unsupported operator `{op}`")]
+    UnsupportedOp {
+        rule: String,
+        line: usize,
+        op: String,
+    },
+}
+
+impl ParseRuleError {
+    /// The 1-based source line the error points at, for an editor to mark.
+    /// A duplicate id is a property of the file, not a place in it.
+    pub fn line(&self) -> Option<usize> {
+        match self {
+            Self::Lex(e) => Some(e.line),
+            Self::Syntax { line, .. }
+            | Self::UndefinedVar { line, .. }
+            | Self::UnsupportedOp { line, .. } => Some(*line),
+            Self::DuplicateId { .. } => None,
+        }
+    }
 }
 
 /// Parses every rule in one source file.
 pub fn parse_rules(src: &str) -> Result<Vec<Rule>, ParseRuleError> {
-    let tokens = tokenize(src)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let spanned = tokenize_spanned(src)?;
+    // Line of each token, so an error can say where it is. Counted once
+    // over the source rather than per token.
+    let mut lines = Vec::with_capacity(spanned.len());
+    let mut tokens = Vec::with_capacity(spanned.len());
+    let (mut line, mut at) = (1, 0);
+    for (token, span) in spanned {
+        line += src[at..span.start].bytes().filter(|b| *b == b'\n').count();
+        at = span.start;
+        lines.push(line);
+        tokens.push(token);
+    }
+    let mut parser = Parser {
+        last_line: lines.last().copied().unwrap_or(1),
+        tokens,
+        lines,
+        pos: 0,
+        at: 0,
+    };
     let mut rules = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -71,18 +114,40 @@ pub fn rule_sources(src: &str) -> Result<Vec<(String, String)>, ParseRuleError> 
 
 struct Parser {
     tokens: Vec<Token>,
+    lines: Vec<usize>,
     pos: usize,
+    /// Index of the token the parser last looked at, peeked or consumed:
+    /// the one an error raised right after refers to.
+    at: usize,
+    /// Where "unexpected end of input" points: the line of the last token.
+    last_line: usize,
 }
 
 impl Parser {
-    fn peek(&self) -> Option<&Token> {
+    fn peek(&mut self) -> Option<&Token> {
+        self.at = self.pos;
         self.tokens.get(self.pos)
     }
 
     fn next(&mut self) -> Option<Token> {
+        self.at = self.pos;
         let token = self.tokens.get(self.pos).cloned();
         self.pos += 1;
         token
+    }
+
+    /// Line of the token last looked at, or the end of the source once the
+    /// tokens ran out.
+    fn line(&self) -> usize {
+        self.lines.get(self.at).copied().unwrap_or(self.last_line)
+    }
+
+    fn syntax(&self, rule: &str, message: String) -> ParseRuleError {
+        ParseRuleError::Syntax {
+            rule: rule.to_string(),
+            line: self.line(),
+            message,
+        }
     }
 
     fn eat(&mut self, expected: &Token, rule: &str) -> Result<(), ParseRuleError> {
@@ -90,10 +155,8 @@ impl Parser {
             self.pos += 1;
             Ok(())
         } else {
-            Err(ParseRuleError::Syntax {
-                rule: rule.to_string(),
-                message: format!("expected {expected:?}, found {:?}", self.peek()),
-            })
+            let found = self.peek().cloned();
+            Err(self.syntax(rule, format!("expected {expected:?}, found {found:?}")))
         }
     }
 
@@ -101,20 +164,17 @@ impl Parser {
         match self.next() {
             Some(Token::Word(word)) if word == "rule" => {}
             other => {
-                return Err(ParseRuleError::Syntax {
-                    rule: "<top level>".into(),
-                    message: format!("expected `rule`, found {other:?}"),
-                })
+                return Err(self.syntax("<top level>", format!("expected `rule`, found {other:?}")))
             }
         }
 
         let id = match self.next() {
             Some(Token::Word(id)) => id,
             other => {
-                return Err(ParseRuleError::Syntax {
-                    rule: "<top level>".into(),
-                    message: format!("expected rule identifier, found {other:?}"),
-                })
+                return Err(self.syntax(
+                    "<top level>",
+                    format!("expected rule identifier, found {other:?}"),
+                ))
             }
         };
 
@@ -123,15 +183,15 @@ impl Parser {
         let mut meta = BTreeMap::new();
         let mut fields = Vec::new();
         let mut condition = None;
+        let mut condition_start = 0;
 
         while self.peek() != Some(&Token::RBrace) {
             let section = match self.next() {
                 Some(Token::Word(word)) => word,
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: id.clone(),
-                        message: format!("expected a section name, found {other:?}"),
-                    })
+                    return Err(
+                        self.syntax(&id, format!("expected a section name, found {other:?}"))
+                    )
                 }
             };
             self.eat(&Token::Colon, &id)?;
@@ -139,26 +199,34 @@ impl Parser {
             match section.as_str() {
                 "meta" => meta = self.meta_section(&id)?,
                 "fields" => fields = self.fields_section(&id)?,
-                "condition" => condition = Some(self.condition(&id)?),
-                other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: id.clone(),
-                        message: format!("unknown section `{other}`"),
-                    })
+                "condition" => {
+                    condition_start = self.pos;
+                    condition = Some(self.condition(&id)?);
                 }
+                other => return Err(self.syntax(&id, format!("unknown section `{other}`"))),
             }
         }
         self.eat(&Token::RBrace, &id)?;
 
-        let condition = condition.ok_or_else(|| ParseRuleError::Syntax {
-            rule: id.clone(),
-            message: "missing `condition:` section".into(),
-        })?;
+        let condition =
+            condition.ok_or_else(|| self.syntax(&id, "missing `condition:` section".into()))?;
 
         // Every referenced variable must be declared, or the rule silently
-        // never matches.
+        // never matches. The error points at the use, found by walking the
+        // condition's tokens again — cheaper than threading spans through
+        // the tree for a path that is only taken on a bad rule.
         let declared: BTreeSet<&str> = fields.iter().map(|f| f.var.as_str()).collect();
-        check_vars(&condition, &declared, &id)?;
+        if let Some(var) = undefined_var(&condition, &declared) {
+            let use_at = self.tokens[condition_start..]
+                .iter()
+                .position(|t| matches!(t, Token::Var(v) if *v == var))
+                .map_or(condition_start, |i| condition_start + i);
+            return Err(ParseRuleError::UndefinedVar {
+                rule: id,
+                line: self.lines.get(use_at).copied().unwrap_or(self.last_line),
+                var,
+            });
+        }
 
         Ok(Rule {
             id,
@@ -184,10 +252,10 @@ impl Parser {
                     meta.insert(key, value);
                 }
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("meta `{key}` needs a string value, found {other:?}"),
-                    })
+                    return Err(self.syntax(
+                        rule,
+                        format!("meta `{key}` needs a string value, found {other:?}"),
+                    ))
                 }
             }
         }
@@ -205,10 +273,7 @@ impl Parser {
             let field = match self.next() {
                 Some(Token::Word(field)) => field,
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("expected a field name, found {other:?}"),
-                    })
+                    return Err(self.syntax(rule, format!("expected a field name, found {other:?}")))
                 }
             };
 
@@ -246,6 +311,7 @@ impl Parser {
                 other => {
                     return Err(ParseRuleError::UnsupportedOp {
                         rule: rule.to_string(),
+                        line: self.line(),
                         op: other.to_string(),
                     })
                 }
@@ -253,6 +319,7 @@ impl Parser {
             other => {
                 return Err(ParseRuleError::UnsupportedOp {
                     rule: rule.to_string(),
+                    line: self.line(),
                     op: format!("{other:?}"),
                 })
             }
@@ -264,18 +331,15 @@ impl Parser {
                 Some(Token::Regex(pattern)) => {
                     // Compiled here so evaluation never pays for it, and a bad
                     // pattern fails loading instead of silently never matching.
-                    let compiled =
-                        regex::Regex::new(&pattern).map_err(|e| ParseRuleError::Syntax {
-                            rule: rule.to_string(),
-                            message: format!("invalid regex `/{pattern}/`: {e}"),
-                        })?;
+                    let compiled = regex::Regex::new(&pattern).map_err(|e| {
+                        self.syntax(rule, format!("invalid regex `/{pattern}/`: {e}"))
+                    })?;
                     Literal::Regex(Box::new(compiled))
                 }
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("`matches` needs /regex/, found {other:?}"),
-                    })
+                    return Err(
+                        self.syntax(rule, format!("`matches` needs /regex/, found {other:?}"))
+                    )
                 }
             },
             _ => match self.next() {
@@ -284,10 +348,7 @@ impl Parser {
                 Some(Token::Word(word)) if word == "true" => Literal::Bool(true),
                 Some(Token::Word(word)) if word == "false" => Literal::Bool(false),
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("expected a value, found {other:?}"),
-                    })
+                    return Err(self.syntax(rule, format!("expected a value, found {other:?}")))
                 }
             },
         };
@@ -302,20 +363,16 @@ impl Parser {
             match self.next() {
                 Some(Token::Str(text)) => items.push(text),
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("`in` takes string values, found {other:?}"),
-                    })
+                    return Err(
+                        self.syntax(rule, format!("`in` takes string values, found {other:?}"))
+                    )
                 }
             }
             match self.next() {
                 Some(Token::Comma) => {}
                 Some(Token::RParen) => break,
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("expected `,` or `)`, found {other:?}"),
-                    })
+                    return Err(self.syntax(rule, format!("expected `,` or `)`, found {other:?}")))
                 }
             }
         }
@@ -368,10 +425,10 @@ impl Parser {
                 Ok(Condition::Var(var))
             }
             Some(Token::Num(_)) => self.n_of(rule),
-            other => Err(ParseRuleError::Syntax {
-                rule: rule.to_string(),
-                message: format!("expected a condition, found {other:?}"),
-            }),
+            other => {
+                let message = format!("expected a condition, found {other:?}");
+                Err(self.syntax(rule, message))
+            }
         }
     }
 
@@ -383,10 +440,10 @@ impl Parser {
         match self.next() {
             Some(Token::Word(word)) if word == "of" => {}
             other => {
-                return Err(ParseRuleError::Syntax {
-                    rule: rule.to_string(),
-                    message: format!("expected `of` after a count, found {other:?}"),
-                })
+                return Err(self.syntax(
+                    rule,
+                    format!("expected `of` after a count, found {other:?}"),
+                ))
             }
         }
         self.eat(&Token::LParen, rule)?;
@@ -396,20 +453,14 @@ impl Parser {
             match self.next() {
                 Some(Token::Var(var)) => vars.push(var),
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("`of` takes variables, found {other:?}"),
-                    })
+                    return Err(self.syntax(rule, format!("`of` takes variables, found {other:?}")))
                 }
             }
             match self.next() {
                 Some(Token::Comma) => {}
                 Some(Token::RParen) => break,
                 other => {
-                    return Err(ParseRuleError::Syntax {
-                        rule: rule.to_string(),
-                        message: format!("expected `,` or `)`, found {other:?}"),
-                    })
+                    return Err(self.syntax(rule, format!("expected `,` or `)`, found {other:?}")))
                 }
             }
         }
@@ -418,35 +469,15 @@ impl Parser {
     }
 }
 
-fn check_vars(
-    condition: &Condition,
-    declared: &BTreeSet<&str>,
-    rule: &str,
-) -> Result<(), ParseRuleError> {
-    let undefined = |var: &String| {
-        (!declared.contains(var.as_str())).then(|| ParseRuleError::UndefinedVar {
-            rule: rule.to_string(),
-            var: var.clone(),
-        })
-    };
-
+/// The first variable the condition uses without declaring, if any.
+fn undefined_var(condition: &Condition, declared: &BTreeSet<&str>) -> Option<String> {
+    let undefined = |var: &String| (!declared.contains(var.as_str())).then(|| var.clone());
     match condition {
-        Condition::Var(var) => match undefined(var) {
-            Some(err) => Err(err),
-            None => Ok(()),
-        },
-        Condition::Not(inner) => check_vars(inner, declared, rule),
+        Condition::Var(var) => undefined(var),
+        Condition::Not(inner) => undefined_var(inner, declared),
         Condition::And(a, b) | Condition::Or(a, b) => {
-            check_vars(a, declared, rule)?;
-            check_vars(b, declared, rule)
+            undefined_var(a, declared).or_else(|| undefined_var(b, declared))
         }
-        Condition::NOf(_, vars) => {
-            for var in vars {
-                if let Some(err) = undefined(var) {
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }
+        Condition::NOf(_, vars) => vars.iter().find_map(undefined),
     }
 }

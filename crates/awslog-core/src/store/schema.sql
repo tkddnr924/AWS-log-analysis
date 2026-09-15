@@ -60,10 +60,42 @@ ALTER TABLE rules ADD COLUMN IF NOT EXISTS log_type VARCHAR;
 -- Rules are registered at parse time and evaluated when first opened. Older
 -- cases were evaluated in full at parse time, hence the default.
 ALTER TABLE rules ADD COLUMN IF NOT EXISTS evaluated BOOLEAN DEFAULT true;
+-- Display name (`meta: name`); NULL on rows from builds without it, read
+-- back as the rule id.
+ALTER TABLE rules ADD COLUMN IF NOT EXISTS name VARCHAR;
 
+-- One row per rule hit. The event summary the results table shows is copied
+-- in when the hit is recorded, so listing, counting, searching and scoping
+-- matches never touch `events` (docs/05 "룰 매치 요약"). Cases written
+-- before these columns existed are rebuilt in `Store::open`.
 CREATE TABLE IF NOT EXISTS rule_matches (
     match_id       UBIGINT PRIMARY KEY,
     rule_id        VARCHAR NOT NULL,
     event_id       UBIGINT NOT NULL,
-    matched_fields JSON NOT NULL
+    matched_fields JSON NOT NULL,
+    log_type       VARCHAR NOT NULL,
+    event_time     TIMESTAMP,
+    event_name     VARCHAR,
+    event_source   VARCHAR,
+    identity_arn   VARCHAR,
+    source_ip      VARCHAR,
+    user_agent     VARCHAR,
+    aws_region     VARCHAR,
+    error_code     VARCHAR,
+    url            VARCHAR,
+    status         VARCHAR,
+    target         VARCHAR,
+    resource       VARCHAR,
+    country        VARCHAR,
+    rule           VARCHAR,
+    method         VARCHAR
+);
+
+-- Leaf paths seen inside the payload columns while parsing, per log type,
+-- with the number of events that carried each (docs/04 "페이로드 키"). The
+-- rule editor offers these; nothing has to be declared before parsing.
+CREATE TABLE IF NOT EXISTS payload_keys (
+    log_type VARCHAR NOT NULL,
+    path     VARCHAR NOT NULL,
+    events   UBIGINT NOT NULL
 );

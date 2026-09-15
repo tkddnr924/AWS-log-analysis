@@ -28,16 +28,9 @@ pub struct LexError {
     pub message: String,
 }
 
-/// Splits source into tokens, dropping `//` and `/* */` comments.
-pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
-    Ok(tokenize_spanned(src)?
-        .into_iter()
-        .map(|(token, _)| token)
-        .collect())
-}
-
-/// [`tokenize`] with each token's byte range in `src`, so a rule's original
-/// text can be cut out of a multi-rule file.
+/// Splits source into tokens with each token's byte range in `src`,
+/// dropping `//` and `/* */` comments. The ranges let the parser report a
+/// line and let an editor cut one rule out of a multi-rule file.
 pub fn tokenize_spanned(src: &str) -> Result<Vec<(Token, std::ops::Range<usize>)>, LexError> {
     let bytes = src.as_bytes();
     let mut tokens = Vec::new();
@@ -151,9 +144,14 @@ pub fn tokenize_spanned(src: &str) -> Result<Vec<(Token, std::ops::Range<usize>)
                     && (bytes[i].is_ascii_alphanumeric()
                         || bytes[i] == b'_'
                         || bytes[i] == b'.'
-                        || bytes[i] == b'[')
+                        || bytes[i] == b'['
+                        || bytes[i] == b'-')
                 {
-                    // Field paths may contain dots and `[]` for arrays.
+                    // Field paths may contain dots, `[]` for arrays and, as
+                    // AWS spells headers (`x-amz-server-side-encryption`),
+                    // hyphens. There is no arithmetic, so a hyphen after a
+                    // word starts nothing else; a negative number always
+                    // follows an operator and is lexed above.
                     if bytes[i] == b'[' {
                         while i < bytes.len() && bytes[i] != b']' {
                             i += 1;

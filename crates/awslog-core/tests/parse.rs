@@ -664,3 +664,65 @@ fn ndjson_producers_normalize_onto_shared_http_columns() {
         "epoch millis, KST"
     );
 }
+
+#[test]
+fn every_payload_path_seen_while_parsing_is_recorded_per_log_type() {
+    // Nothing is declared up front: whatever the producers put inside
+    // requestParameters / responseElements / resources (or the HTTP
+    // request/response objects) becomes a known path the rule editor can
+    // offer, with how many events carried it.
+    let dir = fixture_dir(&[
+        (
+            "trail.json.gz",
+            gzip(
+                cloudtrail_json(&[
+                    cloudtrail_record("ConsoleLogin"),
+                    cloudtrail_record("ConsoleLogin"),
+                ])
+                .as_bytes(),
+            ),
+        ),
+        (
+            "waf.log.gz",
+            gzip(support::waf_record("BLOCK", "rule").as_bytes()),
+        ),
+        (
+            "alb.log.gz",
+            gzip(alb_record("203.0.113.5:1", "GET https://x/ HTTP/1.1", 503, "-").as_bytes()),
+        ),
+    ]);
+    let mut store = Store::create(&dir.path().join("s.duckdb"), "c1", "/logs").unwrap();
+
+    parse::run(dir.path(), &mut store, &ParseOptions::default(), &|_| {}).unwrap();
+
+    let keys = |log_type: Option<&str>| {
+        awslog_core::results::payload_keys(&store, log_type)
+            .unwrap()
+            .into_iter()
+            .map(|k| (k.log_type, k.path, k.events))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        keys(Some("cloudtrail")),
+        [(
+            "cloudtrail".to_owned(),
+            "response.ConsoleLogin".to_owned(),
+            2
+        )]
+    );
+    let waf = keys(Some("waf_acl"));
+    assert!(waf
+        .iter()
+        .any(|(_, path, n)| path == "request.country" && *n == 1));
+    assert!(waf
+        .iter()
+        .any(|(_, path, _)| path == "response.match_details.0.location"));
+    let alb = keys(Some("alb_access"));
+    assert!(alb
+        .iter()
+        .any(|(_, path, _)| path == "response.elb_status_code"));
+    // Every type at once, most frequent first within a type.
+    let all = keys(None);
+    assert_eq!(all.len(), 1 + waf.len() + alb.len());
+    assert!(all.windows(2).all(|w| w[0].0 != w[1].0 || w[0].2 >= w[1].2));
+}

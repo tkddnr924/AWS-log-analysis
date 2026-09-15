@@ -811,18 +811,28 @@ button.primary:hover:not(:disabled) {
 }
 
 /* Unreadable or non-AWS input: dimmed but never hidden, so the exclusion is
-   visible rather than silent. */
+   visible rather than silent. The name keeps its room; the reason is what
+   gets cut, since the tooltip has the whole of it. */
 .file-card.unknown .file-name,
 .file-card.unknown .file-meta {
   color: var(--muted);
 }
 
-.file-card.unknown .file-meta {
-  color: var(--warn);
+.file-card.unknown .file-name {
+  flex: 1 0 12ch;
 }
 
-/* --- sample record --- */
-.sample-panel {
+.file-card.unknown .file-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--warn);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- format card (pre-parse) --- */
+.format-card {
   border: 1px solid var(--glass-line);
   border-radius: var(--radius);
   background: var(--glass);
@@ -833,262 +843,382 @@ button.primary:hover:not(:disabled) {
   box-shadow: var(--glass-edge);
 }
 
-.sample-panel > header {
+.format-card > header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.format-file {
+  font-family: var(--font-mono);
+  font-size: 14px;
+  color: var(--text);
+}
+
+/* The verdict WebLog puts beside the file name: green when every head
+   record would land, amber when some would not. */
+.format-status {
+  font-size: 13px;
+}
+
+.format-status.ok {
+  color: #7ee29a;
+}
+
+.format-status.warn {
+  color: var(--warn);
+}
+
+/* What the head holds: event names with counts, most frequent first. */
+.event-mix {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.event-mix > span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 8px;
+  border: 1px solid rgba(182, 191, 208, 0.16);
+  border-radius: 5px;
+  background: rgba(182, 191, 208, 0.06);
+  font-size: 13px;
+}
+
+.event-mix code {
+  color: #d4dae5;
+}
+
+.event-mix small {
+  color: #8797ad;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The first record as pieces, grouped by what they become (WebLog's
+   format view, adapted to records with dozens of keys). Stored columns
+   carry a caption above; rule paths show the path itself; ignored keys
+   are folded away and dimmed. */
+.piece-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.piece-group h3,
+.piece-group summary {
   display: flex;
   align-items: baseline;
   gap: 10px;
-  margin-bottom: 12px;
-  font-size: 14px;
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #8fa3bf;
 }
 
-.sample-panel h2 {
-  margin: 0;
-  font-family: var(--font-mono);
-  font-weight: 500;
-  font-size: 14px;
+.piece-group h3 span,
+.piece-group summary span {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--muted);
 }
 
-.alb-sample dl {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 8px;
-  margin: 0;
+.piece-group summary {
+  cursor: pointer;
+  list-style: none;
 }
 
-.alb-sample dl > div {
-  min-width: 0;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.025);
+.piece-group summary::before {
+  content: "▸";
+  margin-right: 2px;
 }
 
-.alb-sample dt {
-  margin-bottom: 3px;
+.piece-group[open] summary::before {
+  content: "▾";
+}
+
+.piece-absent {
+  margin: 6px 0 0 2px;
   color: var(--muted);
   font-size: 12px;
 }
 
-.alb-sample dd {
-  overflow: hidden;
-  margin: 0;
-  color: #d4dce8;
+.pieces {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 6px;
+}
+
+/* A piece is a button for the keyboard, not for the eye: the global button
+   chrome (glass, shadow, lift on hover) is all switched off. */
+.piece {
+  --piece-tone: #9bc9ff;
+  --piece-line: rgba(79, 156, 249, 0.3);
+  --piece-bg: rgba(79, 156, 249, 0.07);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  text-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+  transition: none;
+}
+
+.piece:where(:hover:not(:disabled)) {
+  transform: none;
+  border-color: transparent;
+  background: none;
+  box-shadow: none;
+}
+
+.piece.payload {
+  --piece-tone: #c9b3ff;
+  --piece-line: rgba(178, 148, 255, 0.28);
+  --piece-bg: rgba(178, 148, 255, 0.06);
+}
+
+.piece.unused {
+  --piece-tone: #8797ad;
+  --piece-line: rgba(182, 191, 208, 0.14);
+  --piece-bg: rgba(182, 191, 208, 0.035);
+}
+
+.piece-label {
+  padding-left: 1px;
+  color: var(--piece-tone);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.piece-body {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  max-width: 100%;
+  padding: 4px 9px;
+  border: 1px solid var(--piece-line);
+  border-radius: 6px;
+  background: var(--piece-bg);
   font-family: var(--font-mono);
-  font-size: 14px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.piece:where(:hover) .piece-body {
+  border-color: var(--piece-tone);
+}
+
+.piece-key {
+  flex: none;
+  color: var(--piece-tone);
+}
+
+.piece.unused .piece-key {
+  color: #8797ad;
+}
+
+.piece-value {
+  overflow: hidden;
+  max-width: 40ch;
+  color: #d4dce8;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.alb-sample p {
-  margin: 10px 0 0;
-  color: var(--muted);
-  font-size: 13px;
+.piece.unused .piece-value {
+  color: #a7b3c4;
 }
 
-/* --- field mapping --- */
-.mapping > header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-
-.mapping > header .linklike {
-  font-size: 15px;
-}
-
-/* Collapsed: what resolved, at a glance. */
-/* Grouped read-only view: sections down the page, label/value pairs inside.
-   Long payloads get the full width instead of a truncated column. */
-.map-groups {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.map-group h3 {
-  font-size: 13px;
-  font-weight: 400;
-  color: var(--muted);
-  margin: 0 0 7px;
-  padding-bottom: 6px;
-  border-bottom: 1px solid var(--line);
-}
-
-.map-group dl {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 3px;
-  margin: 0;
-}
-
-.map-group dl > div {
-  display: grid;
-  grid-template-columns: 13ch minmax(0, 1fr);
-  gap: 16px;
-  align-items: baseline;
-  min-width: 0;
-  padding: 4px 6px;
-  border-radius: 3px;
-}
-
-/* One line for the fields this record has nothing in, so they cost a line
-   instead of a row each. */
-.map-empty {
-  margin: 4px 0 0 6px;
-  font-size: 14px;
-  color: var(--muted);
-}
-
-/* Alternating tint instead of rules: keeps a long wrapped value tied to its
-   label without adding another border to the card. */
-.map-group dl > div:nth-child(odd) {
-  background: rgba(255, 255, 255, 0.016);
-}
-
-/* The label is part of the evidence, not a caption: only one step quieter
-   than the value it names. */
-.map-group dt {
-  color: #cfd6e4;
-  font-size: 15px;
-  line-height: 1.5;
-  white-space: nowrap;
-}
-
-.map-group dd {
-  margin: 0;
-  min-width: 0;
-}
-
-.map-group dd .map-value {
-  display: block;
-  font-family: var(--font-mono);
-  font-size: 15px;
-  line-height: 1.5;
-  color: var(--text);
-  white-space: normal;
-  word-break: break-all;
-  overflow: visible;
-}
-
-/* One level of the JSON payload, as chips: keys stay scannable and values
-   wrap instead of being cut at the card edge. */
-.kv {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 6px;
-}
-
-.kv li {
-  display: flex;
-  align-items: baseline;
-  gap: 7px;
-  min-width: 0;
-  max-width: 100%;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: var(--glass-strong);
-}
-
-.kv-key {
-  color: #7fb3f5;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  white-space: nowrap;
-}
-
-/* Wrap rather than truncate: a clipped ARN or object key is unrecoverable
-   without a tooltip, and tooltips are not keyboard reachable. */
-.kv-val {
-  font-family: var(--font-mono);
-  font-size: 14px;
-  color: #8fd694;
-  word-break: break-all;
-}
-
-.map-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 14px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-
-/* Give the path column room: fallback chains are long. */
-.map-table th:nth-child(2),
-.map-table td:nth-child(2) {
-  width: 34ch;
-}
-
-/* Resolved values can be a full ARN or a JSON blob: clip, keep the rest in
-   the tooltip, and never let it widen the table. */
-.map-table td:nth-child(3) {
-  max-width: 0;
-}
-
-.map-table th,
-.map-table td {
-  text-align: left;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--line);
-  vertical-align: middle;
-}
-
-.map-table th {
-  background: var(--surface-2);
-  color: var(--muted);
-  font-weight: 500;
-  font-size: 13px;
-}
-
-.map-table tbody tr:last-child td {
-  border-bottom: 0;
-}
-
-.map-table td:first-child {
-  width: 1%;
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  white-space: nowrap;
-}
-
-/* The column name is the contract with the rules, so it stays visible. */
-.map-col {
-  color: var(--accent);
-  font-size: 13px;
-}
-
-.map-input {
-  width: 100%;
-  min-width: 30ch;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  color: var(--text);
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  padding: 4px 8px;
-}
-
-.map-input:focus-visible {
+.piece.picked .piece-body,
+.piece:focus-visible .piece-body {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
-  border-color: var(--accent);
 }
 
-/* A field with no value is normal for optional keys, so it is dimmed rather
-   than flagged as an error. */
-.unmapped .map-name,
-.map-miss {
+.piece:focus-visible {
+  outline: none;
+}
+
+/* Labels to move onto pieces. Dragging is the natural gesture; clicking a
+   piece then a label does the same with a keyboard. */
+.label-palette {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px dashed rgba(182, 191, 208, 0.22);
+  border-radius: 8px;
+}
+
+.palette-hint {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.label-palette > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.label-chip {
+  padding: 3px 9px;
+  border: 1px solid rgba(79, 156, 249, 0.35);
+  border-radius: 999px;
+  background: rgba(79, 156, 249, 0.08);
+  color: #9bc9ff;
+  font-size: 12px;
+  cursor: grab;
+  user-select: none;
+}
+
+.label-chip:hover,
+.label-chip:focus-visible {
+  border-color: rgba(88, 166, 255, 0.7);
+  background: rgba(88, 166, 255, 0.15);
+  outline: none;
+}
+
+.label-chip.ignore {
+  border-style: dashed;
+  border-color: rgba(182, 191, 208, 0.3);
+  background: none;
+  color: #8797ad;
+}
+
+/* Paths the head holds that the first record lacks. */
+.more-paths {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.more-paths summary {
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.more-paths > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.path-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 7px;
+  border: 1px solid rgba(178, 148, 255, 0.25);
+  border-radius: 5px;
+  background: rgba(178, 148, 255, 0.05);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: #c9b3ff;
+}
+
+.path-chip small {
+  color: #8797ad;
+}
+
+/* --- event detail: a ledger, not chips. Sections down the drawer, one
+   aligned key/value row per value; the key column is fixed so values line
+   up and the eye scans down one edge. --- */
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.detail-section h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0 0 6px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--glass-line);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #8fa3bf;
+}
+
+.detail-section h3 span {
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
   color: var(--muted);
 }
 
-.map-miss {
+.detail-section h3 code {
+  color: #c9b3ff;
+}
+
+.detail-section dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 1px;
+  margin: 0;
+}
+
+.detail-section dl > div {
+  display: grid;
+  grid-template-columns: minmax(11ch, 20ch) minmax(0, 1fr);
+  gap: 14px;
+  align-items: baseline;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 4px;
+}
+
+/* Alternating tint keeps a long wrapped value tied to its key without a
+   rule under every row. */
+.detail-section dl > div:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.detail-section dt {
+  color: #cfd6e4;
   font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.detail-section.payload dt code {
+  color: #c9b3ff;
+  font-size: 12.5px;
+}
+
+.detail-section dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-all;
 }
 
 /* --- past cases --- */
@@ -1528,8 +1658,8 @@ button.primary:hover:not(:disabled) {
   padding: 0 8px 0 4px;
 }
 
-/* Icon-only, but not invisible: color and a quiet outline identify edit vs
-   delete before hover; aria-label/title carry the text. */
+/* Icon-only, but not invisible: a quiet blue outline identifies edit before
+   hover; aria-label/title carry the text. */
 .rule-list .rule-actions button {
   display: grid;
   place-items: center;
@@ -1537,10 +1667,10 @@ button.primary:hover:not(:disabled) {
   min-width: 28px;
   height: 28px;
   padding: 0;
-  border: 1px solid rgba(182, 191, 208, 0.2);
+  border: 1px solid rgba(79, 156, 249, 0.34);
   border-radius: 7px;
   background: rgba(182, 191, 208, 0.05);
-  color: var(--muted);
+  color: #9bc9ff;
 }
 
 .rule-list .rule-actions svg {
@@ -1553,25 +1683,9 @@ button.primary:hover:not(:disabled) {
   stroke-linejoin: round;
 }
 
-.rule-list .rule-actions button.edit {
-  border-color: rgba(79, 156, 249, 0.34);
-  color: #9bc9ff;
-}
-
-.rule-list .rule-actions button.delete {
-  border-color: rgba(248, 81, 73, 0.32);
-  color: #ff9a96;
-}
-
 .rule-list .rule-actions button:hover:not(:disabled) {
   background: rgba(182, 191, 208, 0.12);
   filter: brightness(1.15);
-}
-
-.rule-list .rule-actions button.danger {
-  border-color: rgba(248, 81, 73, 0.58);
-  background: rgba(248, 81, 73, 0.18);
-  color: #ffaaa6;
 }
 
 .rule-list .rule-select {
@@ -1702,16 +1816,27 @@ button.primary:hover:not(:disabled) {
   box-shadow: 0 0 7px rgba(104, 181, 234, 0.24);
 }
 
-.rule-id {
+/* `meta: name` is the label; the id is only in the tooltip. */
+.rule-name {
   min-width: 0;
   overflow: hidden;
   color: #dce4ef;
-  font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 600;
-  line-height: 1.2;
+  line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.rule-owner {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid rgba(79, 156, 249, 0.3);
+  border-radius: 999px;
+  color: #9bc9ff;
+  font-style: normal;
+  font-size: 10px;
+  line-height: 1.5;
 }
 
 .hits {
@@ -2078,10 +2203,62 @@ button.primary:hover:not(:disabled) {
 
 .raw-json {
   margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--glass-line);
 }
 
 .raw-json summary {
-  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.raw-json[open] summary {
+  margin-bottom: 8px;
+}
+
+.raw-copy {
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* The original sits in its own well so it reads as quoted material, not
+   as more of the ledger. */
+.raw-json pre {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.28);
+  color: #c9d3e2;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.json-key {
+  color: #9bc9ff;
+}
+
+.json-string {
+  color: #8fd694;
+}
+
+.json-number {
+  color: #f0cf6a;
+}
+
+.json-literal {
+  color: #c9b3ff;
 }
 
 /* Right-side drawer over a scrim: the previous floating card sat on top of
@@ -2096,12 +2273,12 @@ button.primary:hover:not(:disabled) {
 }
 
 .raw {
-  width: min(560px, 46vw);
+  width: min(600px, 48vw);
   height: 100%;
   overflow-y: auto;
-  background: var(--glass);
+  background: rgba(14, 18, 26, 0.96);
   border-left: 1px solid var(--line);
-  padding: 16px 18px;
+  padding: 16px 20px 24px;
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
   box-shadow: var(--glass-edge);
@@ -2111,7 +2288,7 @@ button.primary:hover:not(:disabled) {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-bottom: 12px;
+  margin-bottom: 16px;
 }
 
 .raw h2 {
@@ -2120,12 +2297,15 @@ button.primary:hover:not(:disabled) {
   font-weight: 500;
 }
 
+/* The id is a handle, not a headline. */
+.raw h2 code {
+  margin-left: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 400;
+}
+
 .raw pre {
-  font-size: 14px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--text);
   margin: 0;
 }
 
@@ -2171,19 +2351,59 @@ button.primary:hover:not(:disabled) {
   letter-spacing: -0.01em;
 }
 
+/* Actions live in a footer, as in every dialog the analyst has used. */
+.rule-editor footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.rule-editor footer .error {
+  margin: 0;
+  font-size: 13px;
+}
+
 /* Source left, feedback right: the explanation and the hit count are only
    useful while the text is still in view. */
 .editor-body {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr) 380px;
   gap: 16px;
   flex: 1;
   min-height: 0;
 }
 
+.source-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+/* What acts on the text sits above it. */
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.editor-toolbar button {
+  padding: 5px 11px;
+  font-size: 13px;
+}
+
+.editor-toolbar button[aria-pressed="true"] {
+  border-color: rgba(88, 166, 255, 0.62);
+  background: rgba(88, 166, 255, 0.15);
+  color: #a9d2ff;
+}
+
 .source-pane {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
+  flex: 1;
   min-height: 360px;
   overflow: hidden;
   border: 1px solid rgba(79, 156, 249, 0.24);
@@ -2215,6 +2435,24 @@ button.primary:hover:not(:disabled) {
   line-height: 1.65;
   text-align: right;
   user-select: none;
+}
+
+.gutter .err {
+  color: #ff8a8a;
+  font-weight: 700;
+}
+
+/* The offending line, tinted behind the text. Lives in the highlight layer
+   so it scrolls with the source; the numbers come from the line metrics
+   shared by all three layers. */
+.error-stripe {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1.65em;
+  background: rgba(248, 81, 73, 0.14);
+  box-shadow: inset 3px 0 0 rgba(248, 81, 73, 0.85);
+  pointer-events: none;
 }
 
 .code-stack {
@@ -2317,7 +2555,7 @@ button.primary:hover:not(:disabled) {
 /* The sentence the engine would evaluate. */
 .outline {
   position: relative;
-  overflow: hidden;
+  flex: none;
   padding: 13px 15px 14px;
   border: 1px solid rgba(63, 185, 80, 0.4);
   border-radius: 9px;
@@ -2353,6 +2591,24 @@ button.primary:hover:not(:disabled) {
   color: #ffaaa6;
 }
 
+.outline.broken .outline-dot {
+  background: #ff6b64;
+}
+
+.outline.broken h3 .linklike {
+  margin-left: auto;
+  color: #ffaaa6;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.outline.broken p code {
+  padding: 0 4px;
+  border-radius: 3px;
+  background: rgba(248, 81, 73, 0.18);
+  color: #ffd2cf;
+}
+
 .outline h3 code {
   color: #7d8ba4;
   font-size: 12px;
@@ -2367,8 +2623,7 @@ button.primary:hover:not(:disabled) {
 }
 
 .outline.broken p {
-  color: #ffaaa6;
-  font-family: var(--font-mono);
+  color: #ffd2cf;
 }
 
 .variable-fixes {
@@ -2393,19 +2648,6 @@ button.primary:hover:not(:disabled) {
   font-size: 12px;
 }
 
-.editor-side > .actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0;
-}
-
-.editor-side > .actions button {
-  border-color: rgba(79, 156, 249, 0.28);
-  background: rgba(79, 156, 249, 0.1);
-  color: #a9d2ff;
-}
-
 .hit-count {
   color: #8d9ab0;
   font-size: 13px;
@@ -2416,92 +2658,32 @@ button.primary:hover:not(:disabled) {
   font-variant-numeric: tabular-nums;
 }
 
-.variable-tools {
-  padding: 10px;
-  border: 1px solid rgba(88, 166, 255, 0.25);
-  border-left: 2px solid #58a6ff;
-  border-radius: 8px;
-  background: linear-gradient(
-    135deg,
-    rgba(88, 166, 255, 0.075),
-    rgba(88, 166, 255, 0.02)
-  );
-}
-
-.palette-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.palette-heading h4 {
-  margin: 0;
-  color: #8cc5ff;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.palette-heading span {
-  color: #77849a;
-  font-size: 11px;
-}
-
-.declared-variables {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-bottom: 8px;
-}
-
-.declared-variables button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 7px;
-  border-color: rgba(88, 166, 255, 0.28);
-  background: rgba(88, 166, 255, 0.08);
-}
-
-.declared-variables code {
-  color: #7cbbff;
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.declared-variables button span {
-  max-width: 130px;
-  overflow: hidden;
-  color: #7f8ba0;
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.variable-empty {
-  margin: 0 0 8px;
-  color: #78859a;
-  font-size: 12px;
-}
-
+/* The variable builder: one row above the source, `$name = field`, shown
+   on demand from the toolbar. */
 .variable-builder {
   display: grid;
-  grid-template-columns: minmax(78px, 0.75fr) minmax(110px, 1fr) auto;
-  gap: 5px;
+  grid-template-columns: minmax(96px, 0.5fr) auto minmax(160px, 1.5fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  border-radius: 7px;
+  background: rgba(88, 166, 255, 0.06);
 }
 
 .variable-builder label {
   display: flex;
   align-items: center;
   min-width: 0;
+  height: 28px;
   border: 1px solid rgba(88, 166, 255, 0.25);
   border-radius: 5px;
-  background: rgba(8, 12, 18, 0.48);
+  background: rgba(8, 12, 18, 0.78);
 }
 
-.variable-builder label:focus-within {
+.variable-builder label:focus-within,
+.variable-builder .variable-field:focus {
+  outline: none;
   border-color: rgba(88, 166, 255, 0.7);
 }
 
@@ -2512,38 +2694,43 @@ button.primary:hover:not(:disabled) {
   font-size: 13px;
 }
 
-.variable-builder input,
-.variable-builder select {
+.variable-builder input {
   box-sizing: border-box;
   min-width: 0;
-  height: 27px;
-  border: 1px solid rgba(88, 166, 255, 0.25);
-  border-radius: 5px;
-  background: rgba(8, 12, 18, 0.78);
   color: #cbd5e1;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 13px;
 }
 
-.variable-builder input {
+.variable-builder label input {
   width: 100%;
+  height: 100%;
   padding: 0 6px 0 2px;
   border: 0;
   background: transparent;
 }
 
-.variable-builder select {
-  padding: 0 6px;
+.variable-builder label input:focus {
+  outline: none;
 }
 
-.variable-builder input:focus,
-.variable-builder select:focus {
-  outline: none;
-  border-color: rgba(88, 166, 255, 0.7);
+/* Typed, with a datalist behind it: the payload paths make the choice too
+   long for a select. */
+.variable-builder .variable-field {
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid rgba(88, 166, 255, 0.25);
+  border-radius: 5px;
+  background: rgba(8, 12, 18, 0.78);
+}
+
+.variable-builder > .muted {
+  font-family: var(--font-mono);
 }
 
 .variable-builder button {
-  padding: 4px 8px;
+  padding: 4px 10px;
   border-color: rgba(88, 166, 255, 0.38);
   background: rgba(88, 166, 255, 0.13);
   color: #9bc9ff;
@@ -2551,69 +2738,204 @@ button.primary:hover:not(:disabled) {
   white-space: nowrap;
 }
 
-.variable-help {
-  margin: 7px 0 0;
-  color: #718097;
+/* One palette, not a stack of panels: a card with a group label per row
+   and small mono chips. Chips drag into the source or insert on click. */
+.chips {
+  padding: 12px 14px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.chips > h3 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #e3e9f2;
+}
+
+.chips > h3 span,
+.chip-group h4 span {
+  font-weight: 400;
+  color: var(--muted);
   font-size: 11px;
-  line-height: 1.45;
-}
-/* Insertable tokens. Clicking one keeps the caret where it was. */
-.palette {
-  --palette-tone: #9bc9ff;
-  --palette-bg: rgba(79, 156, 249, 0.08);
-  --palette-line: rgba(79, 156, 249, 0.25);
-  padding: 9px 10px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.055);
-  border-left: 2px solid var(--palette-tone);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.025);
 }
 
-.palette-operator {
-  --palette-tone: #c69cff;
-  --palette-bg: rgba(166, 109, 255, 0.08);
-  --palette-line: rgba(166, 109, 255, 0.24);
+.chip-group {
+  margin-bottom: 10px;
 }
 
-.palette-logic {
-  --palette-tone: #ffbd73;
-  --palette-bg: rgba(255, 166, 66, 0.08);
-  --palette-line: rgba(255, 166, 66, 0.24);
+.chip-group h4 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0 0 5px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #8fa3bf;
 }
 
-.palette-snippet {
-  --palette-tone: #8fdaa0;
-  --palette-bg: rgba(63, 185, 80, 0.075);
-  --palette-line: rgba(63, 185, 80, 0.24);
-}
-
-.palette h4 {
-  margin: 0 0 7px;
-  color: var(--palette-tone);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.palette > div {
+.chip-group > div {
   display: flex;
   flex-wrap: wrap;
-  gap: 5px;
+  align-items: center;
+  gap: 4px 4px;
 }
 
-.palette button {
-  padding: 4px 8px;
-  border-color: var(--palette-line);
-  background: var(--palette-bg);
-  color: var(--palette-tone);
+.chip-empty {
+  color: #718097;
+  font-size: 11.5px;
+}
+
+.payload-filter {
+  box-sizing: border-box;
+  width: 100%;
+  height: 26px;
+  margin: 0 0 6px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 5px;
+  background: rgba(8, 12, 18, 0.7);
+  color: #cbd5e1;
   font-family: var(--font-mono);
   font-size: 12px;
 }
 
-.palette button:hover:not(:disabled) {
-  border-color: var(--palette-tone);
-  background: var(--palette-bg);
-  filter: brightness(1.18);
+.payload-filter:focus {
+  outline: none;
+  border-color: rgba(88, 166, 255, 0.7);
+}
+
+/* Chips: a token each, the tone says which part of the grammar. No button
+   chrome — these read as text you can pick up. */
+.chip {
+  --chip-tone: #9bc9ff;
+  --chip-bg: rgba(79, 156, 249, 0.08);
+  --chip-line: rgba(79, 156, 249, 0.28);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 7px;
+  border: 1px solid var(--chip-line);
+  border-radius: 5px;
+  background: var(--chip-bg);
+  box-shadow: none;
+  text-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  color: var(--chip-tone);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  cursor: grab;
+  transition: none;
+}
+
+.chip:where(:hover:not(:disabled)) {
+  transform: none;
+  border-color: var(--chip-tone);
+  background: var(--chip-bg);
+  box-shadow: none;
+  filter: brightness(1.15);
+}
+
+.chip:active {
+  cursor: grabbing;
+}
+
+.chip small {
+  color: #77849a;
+  font-size: 10px;
+}
+
+.chip-variable {
+  --chip-tone: #58a6ff;
+  --chip-bg: rgba(88, 166, 255, 0.12);
+  --chip-line: rgba(88, 166, 255, 0.4);
+  font-weight: 600;
+}
+
+.chip-payload {
+  --chip-tone: #c9b3ff;
+  --chip-bg: rgba(178, 148, 255, 0.07);
+  --chip-line: rgba(178, 148, 255, 0.26);
+}
+
+.chip-operator {
+  --chip-tone: #ffbd73;
+  --chip-bg: rgba(255, 166, 66, 0.08);
+  --chip-line: rgba(255, 166, 66, 0.26);
+}
+
+.chip-logic {
+  --chip-tone: #c69cff;
+  --chip-bg: rgba(166, 109, 255, 0.08);
+  --chip-line: rgba(166, 109, 255, 0.26);
+}
+
+.chip-snippet {
+  --chip-tone: #8fdaa0;
+  --chip-bg: rgba(63, 185, 80, 0.075);
+  --chip-line: rgba(63, 185, 80, 0.26);
+  font-family: var(--font-ui);
+}
+
+/* The whole language, folded. */
+.grammar summary {
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.grammar pre {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  background: #0d1117;
+  color: #c9d1d9;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+}
+
+.grammar dl {
+  display: grid;
+  grid-template-columns: 9.5ch minmax(0, 1fr);
+  gap: 3px 12px;
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.grammar dl > div {
+  display: contents;
+}
+
+.grammar dt {
+  color: #8fa3bf;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.grammar dd {
+  margin: 0;
+  color: #c9d3e2;
+}
+
+.outline-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #7ee29a;
 }
 
 .discard-note {
@@ -2633,4 +2955,17 @@ button.primary:hover:not(:disabled) {
     0 8px 18px rgba(111, 19, 16, 0.28),
     inset 0 1px 0 rgba(255, 255, 255, 0.28);
   font-weight: 500;
+}
+
+/* Quiet on purpose: red text, no fill. Confirmation turns it into `.danger`. */
+.rule-editor .editor-delete {
+  margin-right: auto;
+  border-color: rgba(248, 81, 73, 0.32);
+  background: rgba(248, 81, 73, 0.06);
+  color: #ff9a96;
+  box-shadow: none;
+}
+
+.rule-editor .editor-delete:hover:not(:disabled) {
+  background: rgba(248, 81, 73, 0.14);
 }

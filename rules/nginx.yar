@@ -3,6 +3,7 @@
 rule nginx_server_error
 {
     meta:
+        name        = "서버 오류 (5xx)"
         description = "nginx returned a server error"
         severity    = "medium"
         log_type    = "nginx_access"

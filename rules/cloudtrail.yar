@@ -4,6 +4,7 @@
 rule cloudtrail_root_console_login
 {
     meta:
+        name        = "루트 계정 콘솔 로그인"
         description = "Root account signed in to the console"
         severity    = "high"
         log_type    = "cloudtrail"
@@ -19,6 +20,7 @@ rule cloudtrail_root_console_login
 rule cloudtrail_console_login_failure
 {
     meta:
+        name        = "콘솔 로그인 실패"
         description = "Failed console login"
         severity    = "medium"
         log_type    = "cloudtrail"
@@ -35,6 +37,7 @@ rule cloudtrail_console_login_failure
 rule cloudtrail_login_without_mfa
 {
     meta:
+        name        = "MFA 없는 콘솔 로그인"
         description = "Console login without MFA"
         severity    = "medium"
         log_type    = "cloudtrail"
@@ -50,6 +53,7 @@ rule cloudtrail_login_without_mfa
 rule cloudtrail_access_denied
 {
     meta:
+        name        = "권한 거부 (AccessDenied)"
         description = "Authorization failure — possible enumeration"
         severity    = "low"
         log_type    = "cloudtrail"
@@ -64,6 +68,7 @@ rule cloudtrail_access_denied
 rule cloudtrail_trail_tampering
 {
     meta:
+        name        = "CloudTrail 로깅 중지·삭제·변경"
         description = "CloudTrail logging stopped or deleted"
         severity    = "high"
         log_type    = "cloudtrail"
@@ -79,6 +84,7 @@ rule cloudtrail_trail_tampering
 rule cloudtrail_long_lived_session
 {
     meta:
+        name        = "비정상적으로 긴 AssumeRole 세션"
         description = "AssumeRole requesting an unusually long session"
         severity    = "low"
         log_type    = "cloudtrail"
@@ -94,6 +100,7 @@ rule cloudtrail_long_lived_session
 rule cloudtrail_root_api_activity
 {
     meta:
+        name        = "루트 계정 API 사용"
         description = "Root account used outside a console login"
         severity    = "high"
         log_type    = "cloudtrail"
@@ -109,6 +116,7 @@ rule cloudtrail_root_api_activity
 rule cloudtrail_iam_policy_change
 {
     meta:
+        name        = "IAM 정책 변경"
         description = "IAM identity policy or policy version changed"
         severity    = "medium"
         log_type    = "cloudtrail"
@@ -124,6 +132,7 @@ rule cloudtrail_iam_policy_change
 rule cloudtrail_access_key_created
 {
     meta:
+        name        = "IAM 액세스 키 생성"
         description = "A new IAM access key was created"
         severity    = "medium"
         log_type    = "cloudtrail"
@@ -139,6 +148,7 @@ rule cloudtrail_access_key_created
 rule cloudtrail_kms_key_disruption
 {
     meta:
+        name        = "KMS 키 비활성화·삭제 예약"
         description = "KMS key disabled or scheduled for deletion"
         severity    = "high"
         log_type    = "cloudtrail"
@@ -154,6 +164,7 @@ rule cloudtrail_kms_key_disruption
 rule cloudtrail_monitoring_disabled
 {
     meta:
+        name        = "GuardDuty·Security Hub 해제"
         description = "GuardDuty or Security Hub monitoring was disabled"
         severity    = "high"
         log_type    = "cloudtrail"

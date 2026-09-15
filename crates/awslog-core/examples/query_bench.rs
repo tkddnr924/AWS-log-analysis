@@ -30,20 +30,7 @@ fn main() {
         );
     }
     let t = Instant::now();
-    let page = results::query(
-        &store,
-        &results::ResultQuery {
-            rule_id: None,
-            window: Window {
-                offset: 0,
-                limit: 1000,
-                search: String::new(),
-                newest_first: false,
-                ..Default::default()
-            },
-        },
-    )
-    .expect("groups");
+    let page = results::query(&store, &Window::default()).expect("groups");
     println!(
         "groups {} total_events={} matched={} {:?}",
         page.groups.len(),
@@ -53,17 +40,13 @@ fn main() {
     );
     for g in &page.groups {
         let t = Instant::now();
-        let page = results::query(
+        let page = results::rule_matches(
             &store,
-            &results::ResultQuery {
-                rule_id: Some(g.rule_id.clone()),
-                window: Window {
-                    offset: 0,
-                    limit: 1000,
-                    search: String::new(),
-                    newest_first: false,
-                    ..Default::default()
-                },
+            &g.rule_id,
+            &Window {
+                offset: 0,
+                limit: 1000,
+                ..Default::default()
             },
         )
         .expect("rule page");
@@ -71,7 +54,7 @@ fn main() {
             "rule {} count={} rows={} {:?}",
             g.rule_id,
             g.match_count,
-            page.matches.len(),
+            page.rows.len(),
             t.elapsed()
         );
     }

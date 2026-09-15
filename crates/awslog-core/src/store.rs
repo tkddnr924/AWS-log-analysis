@@ -1,7 +1,7 @@
 //! DuckDB session store. One case = one database file
 //! (docs/05-data-model.md).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use duckdb::types::{TimeUnit, Value};
@@ -12,10 +12,11 @@ use crate::model::NormalizedEvent;
 
 const SCHEMA: &str = include_str!("store/schema.sql");
 
-/// The summary columns a match row carries, read off the paged subquery
-/// alias `e`. HTTP-style fields (ALB, WAF, API Gateway, nginx) come out of
-/// the JSON bodies; CloudTrail rows get NULLs there.
-const MATCH_ROW_COLUMNS: &str = "e.event_id,
+/// The summary a results row shows, projected from `events e`: the id, the
+/// time twice (raw for storing and comparing, KST text for display), then
+/// the display columns. HTTP-style fields (ALB, WAF, API Gateway, nginx)
+/// come out of the JSON bodies; CloudTrail rows get NULLs there.
+const EVENT_SUMMARY_COLUMNS: &str = "e.event_id, epoch_us(e.event_time),
     strftime(e.event_time + INTERVAL 9 HOUR, '%Y-%m-%d %H:%M:%S.%g'),
     e.event_name, e.event_source, e.identity_arn, e.source_ip,
     json_extract_string(e.request, '$.url'),
@@ -28,6 +29,29 @@ const MATCH_ROW_COLUMNS: &str = "e.event_id,
     json_extract_string(e.request, '$.country'),
     json_extract_string(e.response, '$.terminating_rule_id'),
     json_extract_string(e.request, '$.method')";
+
+/// The same summary read back from `rule_matches e`, where it was stored
+/// by [`Store::append_match_batch`]. Same positions as
+/// [`EVENT_SUMMARY_COLUMNS`] so one reader serves both.
+const MATCH_SUMMARY_COLUMNS: &str = "e.event_id, epoch_us(e.event_time),
+    strftime(e.event_time + INTERVAL 9 HOUR, '%Y-%m-%d %H:%M:%S.%g'),
+    e.event_name, e.event_source, e.identity_arn, e.source_ip,
+    e.url, e.status, e.target, e.user_agent, e.aws_region, e.error_code,
+    e.resource, e.country, e.rule, e.method";
+
+/// Ids per `IN (...)` list when fetching summaries by event id. The primary
+/// key index answers a constant list in a few milliseconds regardless of
+/// case size; a prepared `event_id = ?` per id cost 0.5 ms each (12M-row
+/// bench, plan 260915).
+const SUMMARY_LOOKUP_BATCH: usize = 1_000;
+
+/// Rows per batch when rebuilding an older case's match table on open.
+const MIGRATION_BATCH: u64 = 10_000;
+
+/// Narrows `events e` to one log type through its source file.
+const EVENT_TYPE_FILTER: &str = "AND e.file_id IN (SELECT file_id FROM files WHERE log_type = ?)";
+/// Narrows `rule_matches e`, which carries the type itself.
+const MATCH_TYPE_FILTER: &str = "AND e.log_type = ?";
 
 /// Event columns in the order `scan_events` reads them (after `event_id`,
 /// `file_id`, `record_index`).
@@ -114,6 +138,13 @@ pub struct StoredEvent {
     pub identity_arn: Option<String>,
     pub mfa_authenticated: Option<bool>,
     pub raw: Option<String>,
+}
+
+/// A results row plus the raw time it was sorted and filtered by, which the
+/// match table stores as a `TIMESTAMP` next to the display text.
+struct EventSummary {
+    time_micros: Option<i64>,
+    row: crate::results::MatchRow,
 }
 
 pub struct Store {
@@ -260,22 +291,93 @@ impl Store {
 
     /// Reopens an existing case, e.g. to view results without re-parsing.
     /// The schema is idempotent and carries column migrations, so an older
-    /// case picks them up here.
+    /// case picks them up here. A match table without the summary columns
+    /// is rebuilt from its hits, so recorded evaluations survive.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         Self::configure(&conn)?;
-        conn.execute_batch(SCHEMA)?;
-        let next_match: u64 = conn
-            .query_row(
-                "SELECT coalesce(max(match_id) + 1, 0) FROM rule_matches",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        Ok(Self {
+        // Detected before the schema runs: `CREATE TABLE IF NOT EXISTS`
+        // would keep the old shape, and adding sixteen columns leaves the
+        // rows empty either way. The old table is set aside and refilled.
+        let old_matches: bool = conn.query_row(
+            "SELECT count(*) > 0 FROM information_schema.columns
+             WHERE table_name = 'rule_matches'
+               AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                               WHERE table_name = 'rule_matches' AND column_name = 'log_type')",
+            [],
+            |r| r.get(0),
+        )?;
+        // Schema and refill are one transaction. Were the rename and the new
+        // table to persist before the refill, an error or crash midway would
+        // leave a new-shaped table with part of the hits, which the next
+        // open would accept as complete while the rules still read as
+        // evaluated. Rolled back, the next open finds the old table again.
+        conn.execute_batch("BEGIN TRANSACTION")?;
+        let mut store = Self {
             conn,
-            next_match_id: next_match,
-        })
+            next_match_id: 0,
+        };
+        if let Err(e) = store.migrate(old_matches) {
+            // Best effort: the transaction dies with the connection anyway.
+            let _ = store.conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+        store.conn.execute_batch("COMMIT")?;
+        Ok(store)
+    }
+
+    /// The transactional half of [`Self::open`]: applies the schema, sets
+    /// the match id counter and, for an old-shaped match table, refills it.
+    fn migrate(&mut self, old_matches: bool) -> Result<(), StoreError> {
+        if old_matches {
+            self.conn.execute_batch(
+                "DROP TABLE IF EXISTS rule_matches_v1;
+                 ALTER TABLE rule_matches RENAME TO rule_matches_v1;",
+            )?;
+        }
+        self.conn.execute_batch(SCHEMA)?;
+        self.next_match_id = self.conn.query_row(
+            "SELECT coalesce(max(match_id) + 1, 0) FROM rule_matches",
+            [],
+            |r| r.get(0),
+        )?;
+        if old_matches {
+            self.migrate_matches()?;
+        }
+        Ok(())
+    }
+
+    /// Refills `rule_matches` from `rule_matches_v1` (id, rule, evidence
+    /// only), fetching each hit's summary by event id. Batched so a case
+    /// with millions of hits never holds them all at once.
+    fn migrate_matches(&mut self) -> Result<(), StoreError> {
+        let mut offset = 0u64;
+        loop {
+            let batch: Vec<(String, crate::rule::Hit)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT rule_id, event_id, matched_fields FROM rule_matches_v1
+                     ORDER BY match_id LIMIT ? OFFSET ?",
+                )?;
+                let rows = stmt.query_map(params![MIGRATION_BATCH, offset], |row| {
+                    let fields: String = row.get(2)?;
+                    Ok((
+                        row.get(0)?,
+                        crate::rule::Hit {
+                            event_id: row.get(1)?,
+                            matched_fields: serde_json::from_str(&fields).unwrap_or_default(),
+                        },
+                    ))
+                })?;
+                rows.collect::<Result<_, _>>()?
+            };
+            if batch.is_empty() {
+                break;
+            }
+            self.append_match_batch(&batch)?;
+            offset += batch.len() as u64;
+        }
+        self.conn.execute_batch("DROP TABLE rule_matches_v1")?;
+        Ok(())
     }
 
     /// Sets the temp directory so large sorts spill inside the case, not into
@@ -317,6 +419,42 @@ impl Store {
         Ok(())
     }
 
+    /// Replaces the recorded payload paths with this run's. One run per
+    /// case, so replacing is the same as writing.
+    pub fn write_payload_keys<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = (&'a str, &'a str, u64)>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute("DELETE FROM payload_keys", [])?;
+        let mut appender = self.conn.appender("payload_keys")?;
+        for (log_type, path, events) in keys {
+            appender.append_row(params![log_type, path, events])?;
+        }
+        appender.flush()?;
+        Ok(())
+    }
+
+    /// Payload paths the case holds, most frequent first within a type;
+    /// `log_type` narrows to one type.
+    pub fn payload_keys(
+        &self,
+        log_type: Option<&str>,
+    ) -> Result<Vec<crate::results::PayloadKey>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT log_type, path, events FROM payload_keys
+             WHERE ? IS NULL OR log_type = ?
+             ORDER BY log_type, events DESC, path",
+        )?;
+        let rows = stmt.query_map(params![log_type, log_type], |row| {
+            Ok(crate::results::PayloadKey {
+                log_type: row.get(0)?,
+                path: row.get(1)?,
+                events: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Opens one long-lived appender for a parser file.
     pub fn event_writer(&mut self) -> Result<EventWriter<'_>, StoreError> {
         let appender = self.conn.appender("events")?;
@@ -338,7 +476,7 @@ impl Store {
     pub fn event_count(&self, window: &crate::results::Window) -> Result<u64, StoreError> {
         let sql = format!(
             "SELECT count(*) FROM events e WHERE true {}",
-            Self::scope_filter(window)
+            Self::scope_filter(window, EVENT_TYPE_FILTER)
         );
         Ok(self.conn.query_row(
             &sql,
@@ -382,6 +520,32 @@ impl Store {
                 self.conn.execute(
                     "UPDATE rules SET log_type = ? WHERE rule_id = ? AND log_type IS NULL",
                     params![log_type, rule.id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether any recorded rule lacks its display name: true for cases
+    /// written before the column existed, which the app backfills.
+    pub fn rules_lack_name(&self) -> Result<bool, StoreError> {
+        let missing: u64 =
+            self.conn
+                .query_row("SELECT count(*) FROM rules WHERE name IS NULL", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(missing > 0)
+    }
+
+    /// Fills `rules.name` from a rule set's `meta: name`. Only NULLs are
+    /// filled and only from rules that declare a name, so a nameless rule
+    /// keeps reading as its id instead of pinning the id into the column.
+    pub fn backfill_rule_names(&mut self, rules: &[crate::rule::Rule]) -> Result<(), StoreError> {
+        for rule in rules {
+            if let Some(name) = rule.meta.get("name") {
+                self.conn.execute(
+                    "UPDATE rules SET name = ? WHERE rule_id = ? AND name IS NULL",
+                    params![name, rule.id],
                 )?;
             }
         }
@@ -555,7 +719,6 @@ impl Store {
     /// self-describing: severity and description survive a directory copy
     /// even without the rule files (docs/07).
     fn record_rules(&mut self, rules: &[crate::rule::Rule]) -> Result<(), StoreError> {
-        self.conn.execute("DELETE FROM rules", [])?;
         for rule in rules {
             self.upsert_rule(rule)?;
         }
@@ -577,10 +740,13 @@ impl Store {
         self.conn
             .execute("DELETE FROM rules WHERE rule_id = ?", params![rule.id])?;
         self.conn.execute(
-            "INSERT INTO rules (rule_id, severity, description, log_type, evaluated)
-             VALUES (?, ?, ?, ?, false)",
+            "INSERT INTO rules (rule_id, name, severity, description, log_type, evaluated)
+             VALUES (?, ?, ?, ?, ?, false)",
             params![
                 rule.id,
+                // NULL, not the id: `rule_groups` falls back to the id and
+                // a later backfill may still fill it.
+                rule.meta.get("name"),
                 rule.severity(),
                 rule.description(),
                 rule.meta.get("log_type")
@@ -632,17 +798,59 @@ impl Store {
         })
     }
 
-    /// Appends one batch of rule hits. Called repeatedly while streaming so
-    /// matches never accumulate in memory (NFR-2).
+    /// Appends one batch of rule hits with each event's summary. Called
+    /// repeatedly while streaming so matches never accumulate in memory
+    /// (NFR-2). The summary is fetched here rather than carried by the
+    /// scan: the scan reads only the columns the rule names, and the hits
+    /// are a small fraction of what it reads.
     pub fn append_match_batch(
         &mut self,
         batch: &[(String, crate::rule::Hit)],
     ) -> Result<(), StoreError> {
+        let ids: Vec<u64> = batch.iter().map(|(_, hit)| hit.event_id).collect();
+        let types = self.file_log_types()?;
+        let summaries = self.event_summaries(&ids, &types)?;
         let mut appender = self.conn.appender("rule_matches")?;
         for (rule_id, hit) in batch {
             let fields =
                 serde_json::to_string(&hit.matched_fields).unwrap_or_else(|_| "{}".to_string());
-            appender.append_row(params![self.next_match_id, rule_id, hit.event_id, fields])?;
+            // A hit for an unknown event keeps its evidence; the summary is
+            // simply empty. The type comes from the file either way.
+            let (time, row) = summaries
+                .get(&hit.event_id)
+                .map(|s| (s.time_micros, Some(&s.row)))
+                .unwrap_or((None, None));
+            let text = |pick: fn(&crate::results::MatchRow) -> &Option<String>| {
+                row.and_then(|r| pick(r).clone())
+            };
+            appender.append_row(params![
+                self.next_match_id,
+                rule_id,
+                hit.event_id,
+                fields,
+                types
+                    .get(&((hit.event_id >> 32) as u32))
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                time.map_or(Value::Null, |us| Value::Timestamp(
+                    TimeUnit::Microsecond,
+                    us
+                )),
+                text(|r| &r.event_name),
+                text(|r| &r.event_source),
+                text(|r| &r.identity_arn),
+                text(|r| &r.source_ip),
+                text(|r| &r.user_agent),
+                text(|r| &r.aws_region),
+                text(|r| &r.error_code),
+                text(|r| &r.url),
+                text(|r| &r.status),
+                text(|r| &r.target),
+                text(|r| &r.resource),
+                text(|r| &r.country),
+                text(|r| &r.rule),
+                text(|r| &r.method),
+            ])?;
             self.next_match_id += 1;
         }
         appender.flush()?;
@@ -654,7 +862,8 @@ impl Store {
     ///
     /// Only rules that can apply are listed: under a log type, rules scoped
     /// to it or unscoped; otherwise rules for any type the case actually
-    /// holds events of. Counts honour the window's date range.
+    /// holds events of. Counts honour the window's type and date range,
+    /// read off the match rows themselves.
     pub fn rule_groups(
         &self,
         window: &crate::results::Window,
@@ -663,13 +872,14 @@ impl Store {
         // nothing is coverage information, and dropping it makes an
         // unexercised rule look like one that was never loaded.
         let sql = format!(
-            "SELECT r.rule_id, count(m.event_id), r.severity, r.description, r.evaluated
-             FROM rules r LEFT JOIN rule_matches m
-               ON m.rule_id = r.rule_id {match_scope}
+            "SELECT r.rule_id, count(e.event_id), r.severity, r.description, r.evaluated,
+                    coalesce(r.name, r.rule_id)
+             FROM rules r LEFT JOIN rule_matches e
+               ON e.rule_id = r.rule_id {match_scope}
              WHERE r.log_type IS NULL OR {rule_type}
-             GROUP BY r.rule_id, r.severity, r.description, r.evaluated
-             ORDER BY count(m.event_id) DESC, r.rule_id",
-            match_scope = Self::match_scope(window),
+             GROUP BY r.rule_id, r.name, r.severity, r.description, r.evaluated
+             ORDER BY count(e.event_id) DESC, r.rule_id",
+            match_scope = Self::scope_filter(window, MATCH_TYPE_FILTER),
             rule_type = if window.log_type.is_some() {
                 "r.log_type = ?"
             } else {
@@ -689,6 +899,7 @@ impl Store {
                 severity: row.get(2)?,
                 description: row.get(3)?,
                 evaluated: row.get(4)?,
+                name: row.get(5)?,
             });
         }
         Ok(groups)
@@ -697,8 +908,8 @@ impl Store {
     /// Events matched by at least one rule, inside the window's scope.
     pub fn matched_event_count(&self, window: &crate::results::Window) -> Result<u64, StoreError> {
         let sql = format!(
-            "SELECT count(DISTINCT event_id) FROM rule_matches m WHERE true {}",
-            Self::match_scope(window)
+            "SELECT count(DISTINCT e.event_id) FROM rule_matches e WHERE true {}",
+            Self::scope_filter(window, MATCH_TYPE_FILTER)
         );
         Ok(self.conn.query_row(
             &sql,
@@ -707,13 +918,18 @@ impl Store {
         )?)
     }
 
-    /// Predicates narrowing events `e` to the window's log type and KST date
-    /// range. Dates are `YYYY-MM-DD` in KST: `from` is that day's 00:00, `to`
-    /// runs through the end of that day. An event without a time is outside
-    /// any date range. Callers bind [`Self::scope_params`] before any search
-    /// params, in this order: log type, from, to.
-    fn scope_filter(window: &crate::results::Window) -> String {
-        let mut sql = Self::type_filter(window.log_type.as_deref(), "e.file_id");
+    /// Predicates narrowing rows aliased `e` to the window's log type and
+    /// KST date range; `type_filter` is [`EVENT_TYPE_FILTER`] or
+    /// [`MATCH_TYPE_FILTER`] depending on the table. Dates are `YYYY-MM-DD`
+    /// in KST: `from` is that day's 00:00, `to` runs through the end of that
+    /// day. A row without a time is outside any date range. Callers bind
+    /// [`Self::scope_params`] before any search params, in this order: log
+    /// type, from, to.
+    fn scope_filter(window: &crate::results::Window, type_filter: &str) -> String {
+        let mut sql = String::new();
+        if window.log_type.is_some() {
+            sql.push_str(type_filter);
+        }
         if window.from.is_some() {
             sql.push_str(" AND e.event_time >= CAST(? AS TIMESTAMP) - INTERVAL 9 HOUR");
         }
@@ -779,26 +995,6 @@ impl Store {
                 "[year]-[month]-[day] [hour]:[minute]:[second]"
             ))
             .map_err(|_| bad())
-    }
-
-    /// The same scope for a `rule_matches m` row, through its event. Empty
-    /// when the window is unscoped so the common case stays a plain scan.
-    fn match_scope(window: &crate::results::Window) -> String {
-        if window.log_type.is_none() && window.from.is_none() && window.to.is_none() {
-            return String::new();
-        }
-        format!(
-            "AND m.event_id IN (SELECT e.event_id FROM events e WHERE true {})",
-            Self::scope_filter(window)
-        )
-    }
-
-    /// Restricts rows to one log type through the file they came from.
-    fn type_filter(log_type: Option<&str>, file_expr: &str) -> String {
-        match log_type {
-            None => String::new(),
-            Some(_) => format!("AND {file_expr} IN (SELECT file_id FROM files WHERE log_type = ?)"),
-        }
     }
 
     fn type_params(log_type: Option<&str>) -> Vec<Value> {
@@ -895,20 +1091,21 @@ impl Store {
 
     /// One page of every event regardless of rules. This is how an analyst
     /// sees what the rules did not catch.
+    ///
+    /// Two steps on purpose. Sorting `e.*` made the top-N read every column
+    /// of every row it considered, JSON bodies included: 4 s per page at
+    /// offset 200k on 12M rows. Sorting ids alone reads two narrow columns
+    /// (0.2 s), and the page's summaries come by primary key (8 ms).
     pub fn all_events(
         &self,
         window: &crate::results::Window,
     ) -> Result<Vec<crate::results::MatchRow>, StoreError> {
-        // JSON extraction sits outside the paged subquery so it runs on the
-        // page's rows only, never on every row the sort considered.
         let sql = format!(
-            "SELECT {cols}, '{{}}' FROM (
-                SELECT e.* FROM events e
-                WHERE true {type_filter} {filter}
-                {order}
-                LIMIT ? OFFSET ?) e",
-            cols = MATCH_ROW_COLUMNS,
-            type_filter = Self::scope_filter(window),
+            "SELECT e.event_id FROM events e
+             WHERE true {type_filter} {filter}
+             {order}
+             LIMIT ? OFFSET ?",
+            type_filter = Self::scope_filter(window, EVENT_TYPE_FILTER),
             filter = Self::search_filter(&window.search),
             order = Self::order_by(window.newest_first),
         );
@@ -916,52 +1113,87 @@ impl Store {
         params.extend(Self::search_params(&window.search));
         params.push(Value::UBigInt(window.page_limit()));
         params.push(Value::UBigInt(window.offset));
-        self.match_rows(&sql, params)
+        let ids: Vec<u64> = {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(duckdb::params_from_iter(params), |row| row.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut summaries = self.event_summaries(&ids, &self.file_log_types()?)?;
+        // Back in sort order: the lookup returns them keyed, not ordered.
+        Ok(ids
+            .iter()
+            .filter_map(|id| summaries.remove(id))
+            .map(|s| s.row)
+            .collect())
     }
 
-    /// Runs a paged query shaped by [`MATCH_ROW_COLUMNS`] plus a trailing
-    /// `matched_fields` column and resolves each row's log type.
-    fn match_rows(
+    /// Summaries of the given events, by id. Lists of constants go through
+    /// the primary key index, so this costs the same on a 300M-row case as
+    /// on a small one. Ids the case does not hold are absent from the map.
+    fn event_summaries(
         &self,
-        sql: &str,
-        params: Vec<Value>,
-    ) -> Result<Vec<crate::results::MatchRow>, StoreError> {
-        let types = self.file_log_types()?;
-        let mut stmt = self.conn.prepare(sql)?;
-        let mut rows = stmt.query(duckdb::params_from_iter(params))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let event_id: u64 = row.get(0)?;
-            out.push(crate::results::MatchRow {
-                event_id,
-                event_time: row.get(1)?,
-                event_name: row.get(2)?,
-                event_source: row.get(3)?,
-                identity_arn: row.get(4)?,
-                source_ip: row.get(5)?,
-                url: row.get(6)?,
-                status: row.get(7)?,
-                target: row.get(8)?,
-                user_agent: row.get(9)?,
-                aws_region: row.get(10)?,
-                error_code: row.get(11)?,
-                resource: row.get(12)?,
-                country: row.get(13)?,
-                rule: row.get(14)?,
-                method: row.get(15)?,
-                matched_fields: row.get(16)?,
-                // Ids are `file_id << 32 | record_index`; the small files
-                // table is read once instead of joined under the sort.
-                log_type: types
-                    .get(&((event_id >> 32) as u32))
-                    .cloned()
-                    .unwrap_or_default(),
-            });
+        ids: &[u64],
+        types: &HashMap<u32, String>,
+    ) -> Result<HashMap<u64, EventSummary>, StoreError> {
+        let mut out = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(SUMMARY_LOOKUP_BATCH) {
+            // Ids are integers we computed, never user text: safe to inline,
+            // and a bound list would not reach the index.
+            let list = chunk
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT {EVENT_SUMMARY_COLUMNS} FROM events e WHERE e.event_id IN ({list})"
+            ))?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                let summary = Self::read_summary(row, types, "{}".to_owned())?;
+                out.insert(summary.row.event_id, summary);
+            }
         }
         Ok(out)
     }
 
-    fn file_log_types(&self) -> Result<std::collections::HashMap<u32, String>, StoreError> {
+    /// Reads one row shaped by [`EVENT_SUMMARY_COLUMNS`] or
+    /// [`MATCH_SUMMARY_COLUMNS`]. Ids are `file_id << 32 | record_index`,
+    /// so the type comes from the small files table rather than a join.
+    fn read_summary(
+        row: &duckdb::Row<'_>,
+        types: &HashMap<u32, String>,
+        matched_fields: String,
+    ) -> Result<EventSummary, StoreError> {
+        let event_id: u64 = row.get(0)?;
+        Ok(EventSummary {
+            time_micros: row.get(1)?,
+            row: crate::results::MatchRow {
+                event_id,
+                event_time: row.get(2)?,
+                event_name: row.get(3)?,
+                event_source: row.get(4)?,
+                identity_arn: row.get(5)?,
+                source_ip: row.get(6)?,
+                url: row.get(7)?,
+                status: row.get(8)?,
+                target: row.get(9)?,
+                user_agent: row.get(10)?,
+                aws_region: row.get(11)?,
+                error_code: row.get(12)?,
+                resource: row.get(13)?,
+                country: row.get(14)?,
+                rule: row.get(15)?,
+                method: row.get(16)?,
+                matched_fields,
+                log_type: types
+                    .get(&((event_id >> 32) as u32))
+                    .cloned()
+                    .unwrap_or_default(),
+            },
+        })
+    }
+
+    fn file_log_types(&self) -> Result<HashMap<u32, String>, StoreError> {
         let mut stmt = self.conn.prepare("SELECT file_id, log_type FROM files")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -972,7 +1204,7 @@ impl Store {
     pub fn event_count_matching(&self, window: &crate::results::Window) -> Result<u64, StoreError> {
         let sql = format!(
             "SELECT count(*) FROM events e WHERE true {} {}",
-            Self::scope_filter(window),
+            Self::scope_filter(window, EVENT_TYPE_FILTER),
             Self::search_filter(&window.search)
         );
         let mut params = Self::scope_params(window)?;
@@ -1030,8 +1262,9 @@ impl Store {
         Ok(fields)
     }
 
-    /// One page of a rule's matches, joined to the event summary. The search
-    /// is scoped to this rule: it narrows what the rule already selected
+    /// One page of a rule's matches, from the match table alone: the
+    /// summary was stored with the hit, so no event is read. The search is
+    /// scoped to this rule: it narrows what the rule already selected
     /// rather than searching the whole case.
     pub fn rule_matches(
         &self,
@@ -1039,14 +1272,11 @@ impl Store {
         window: &crate::results::Window,
     ) -> Result<Vec<crate::results::MatchRow>, StoreError> {
         let sql = format!(
-            "SELECT {cols}, e.matched_fields FROM (
-                SELECT e.*, m.matched_fields
-                FROM rule_matches m JOIN events e USING (event_id)
-                WHERE m.rule_id = ? {type_filter} {filter}
-                {order}
-                LIMIT ? OFFSET ?) e",
-            cols = MATCH_ROW_COLUMNS,
-            type_filter = Self::scope_filter(window),
+            "SELECT {MATCH_SUMMARY_COLUMNS}, e.matched_fields FROM rule_matches e
+             WHERE e.rule_id = ? {type_filter} {filter}
+             {order}
+             LIMIT ? OFFSET ?",
+            type_filter = Self::scope_filter(window, MATCH_TYPE_FILTER),
             filter = Self::search_filter(&window.search),
             order = Self::order_by(window.newest_first),
         );
@@ -1055,20 +1285,27 @@ impl Store {
         params.extend(Self::search_params(&window.search));
         params.push(Value::UBigInt(window.page_limit()));
         params.push(Value::UBigInt(window.offset));
-        self.match_rows(&sql, params)
+        let types = self.file_log_types()?;
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params_from_iter(params))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(Self::read_summary(row, &types, row.get(17)?)?.row);
+        }
+        Ok(out)
     }
 
-    /// A rule's matches under the window's type and search, for the count
-    /// under the table. Without either this is the group's hit count.
+    /// A rule's matches under the window's type, range and search, for the
+    /// count under the table. Without any of them this is the group's hit
+    /// count.
     pub fn rule_match_count(
         &self,
         rule_id: &str,
         window: &crate::results::Window,
     ) -> Result<u64, StoreError> {
         let sql = format!(
-            "SELECT count(*) FROM rule_matches m JOIN events e USING (event_id)
-             WHERE m.rule_id = ? {} {}",
-            Self::scope_filter(window),
+            "SELECT count(*) FROM rule_matches e WHERE e.rule_id = ? {} {}",
+            Self::scope_filter(window, MATCH_TYPE_FILTER),
             Self::search_filter(&window.search)
         );
         let mut params = vec![Value::Text(rule_id.to_owned())];
