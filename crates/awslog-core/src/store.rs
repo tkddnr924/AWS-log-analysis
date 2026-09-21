@@ -91,6 +91,10 @@ pub enum StoreError {
     BadDateTime(String),
     #[error("rule evaluation failed: {0}")]
     RuleRun(String),
+    // A run the user walked away from. Not a failure: the work is simply
+    // not recorded, and the next attempt starts over.
+    #[error("작업이 취소되었습니다")]
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -606,7 +610,7 @@ impl Store {
         &self,
         visit: impl FnMut(u64, &str, NormalizedEvent),
     ) -> Result<(), StoreError> {
-        self.scan_events(None, |_| true, visit)
+        self.scan_events(None, |_| true, visit, || false)
     }
 
     /// Streams stored events for rule evaluation, in `file_id` then
@@ -616,6 +620,12 @@ impl Store {
     /// `None`. A rule only looks at the columns it names, so reading the
     /// JSON bodies for a rule on `event_name` would be pure cost. `None`
     /// reads everything. `wants` skips whole files by log type.
+    ///
+    /// `cancelled` is polled before the first query, at every file, chunk
+    /// and row boundary and once the pass is over, so a run the user
+    /// abandoned stops promptly and never reports success. It returns
+    /// [`StoreError::Cancelled`]; callers that cannot be cancelled pass
+    /// `|| false`.
     ///
     /// Reads go in bounded chunks, not one query over the table:
     /// `duckdb-rs` materializes a query's whole result, and one holding
@@ -627,8 +637,12 @@ impl Store {
         columns: Option<&BTreeSet<&str>>,
         mut wants: impl FnMut(&str) -> bool,
         mut visit: impl FnMut(u64, &str, NormalizedEvent),
+        cancelled: impl Fn() -> bool,
     ) -> Result<(), StoreError> {
         const CHUNK: u64 = 50_000;
+        if cancelled() {
+            return Err(StoreError::Cancelled);
+        }
         let files: Vec<(u32, String)> = {
             let mut stmt = self
                 .conn
@@ -652,14 +666,26 @@ impl Store {
             projected.join(", ")
         ))?;
         for (file_id, log_type) in files {
+            if cancelled() {
+                return Err(StoreError::Cancelled);
+            }
             if !wants(&log_type) {
                 continue;
             }
             let mut from = 0u64;
             loop {
+                if cancelled() {
+                    return Err(StoreError::Cancelled);
+                }
                 let mut rows = stmt.query(params![file_id, from, from + CHUNK])?;
                 let mut seen = 0u64;
                 while let Some(row) = rows.next()? {
+                    // Per row, before the columns are read: a chunk holds
+                    // 50,000 of them and an abandoned run must stop here,
+                    // not at the end of the file.
+                    if cancelled() {
+                        return Err(StoreError::Cancelled);
+                    }
                     seen += 1;
                     let event_id: u64 = row.get(0)?;
                     visit(
@@ -698,6 +724,11 @@ impl Store {
                 }
                 from += CHUNK;
             }
+        }
+        // A scan that read nothing — no files, or none of the wanted type —
+        // must still report a cancel that arrived while it ran.
+        if cancelled() {
+            return Err(StoreError::Cancelled);
         }
         Ok(())
     }
@@ -1089,42 +1120,73 @@ impl Store {
         }
     }
 
+    fn page_filter(window: &crate::results::Window, params: &mut Vec<Value>) -> String {
+        let Some(after) = &window.after else {
+            return String::new();
+        };
+        let comparison = if window.newest_first { "<" } else { ">" };
+        if let Some(time) = &after.time_micros {
+            params.push(Value::Text(time.clone()));
+            params.push(Value::Text(after.event_id.clone()));
+            format!(
+                "AND ((e.event_time, e.event_id) {comparison}
+                      (make_timestamp(CAST(? AS BIGINT)), CAST(? AS UBIGINT))
+                      OR e.event_time IS NULL)"
+            )
+        } else {
+            params.push(Value::Text(after.event_id.clone()));
+            format!("AND e.event_time IS NULL AND e.event_id {comparison} CAST(? AS UBIGINT)")
+        }
+    }
+
     /// One page of every event regardless of rules. This is how an analyst
     /// sees what the rules did not catch.
     ///
-    /// Two steps on purpose. Sorting `e.*` made the top-N read every column
-    /// of every row it considered, JSON bodies included: 4 s per page at
-    /// offset 200k on 12M rows. Sorting ids alone reads two narrow columns
-    /// (0.2 s), and the page's summaries come by primary key (8 ms).
+    /// Sort only narrow keys, then fetch the page's summaries by primary key.
+    /// Continuations seek past the last key instead of sorting discarded rows.
     pub fn all_events(
         &self,
         window: &crate::results::Window,
-    ) -> Result<Vec<crate::results::MatchRow>, StoreError> {
+    ) -> Result<crate::results::EventPage, StoreError> {
+        let mut params = Self::scope_params(window)?;
+        params.extend(Self::search_params(&window.search));
+        let continuation = Self::page_filter(window, &mut params);
         let sql = format!(
-            "SELECT e.event_id FROM events e
-             WHERE true {type_filter} {filter}
+            "SELECT e.event_id, epoch_us(e.event_time) FROM events e
+             WHERE true {type_filter} {filter} {continuation}
              {order}
-             LIMIT ? OFFSET ?",
+             LIMIT ?",
             type_filter = Self::scope_filter(window, EVENT_TYPE_FILTER),
             filter = Self::search_filter(&window.search),
             order = Self::order_by(window.newest_first),
         );
-        let mut params = Self::scope_params(window)?;
-        params.extend(Self::search_params(&window.search));
         params.push(Value::UBigInt(window.page_limit()));
-        params.push(Value::UBigInt(window.offset));
-        let ids: Vec<u64> = {
+        let mut ids = Vec::new();
+        let mut last_time: Option<i64> = None;
+        {
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(duckdb::params_from_iter(params), |row| row.get(0))?;
-            rows.collect::<Result<_, _>>()?
-        };
+            let mut rows = stmt.query(duckdb::params_from_iter(params))?;
+            while let Some(row) = rows.next()? {
+                ids.push(row.get::<_, u64>(0)?);
+                last_time = row.get(1)?;
+            }
+        }
+        let next_cursor = ids.last().map(|id| crate::results::EventCursor {
+            event_id: id.to_string(),
+            time_micros: last_time.map(|us| us.to_string()),
+        });
         let mut summaries = self.event_summaries(&ids, &self.file_log_types()?)?;
         // Back in sort order: the lookup returns them keyed, not ordered.
-        Ok(ids
+        let rows = ids
             .iter()
             .filter_map(|id| summaries.remove(id))
             .map(|s| s.row)
-            .collect())
+            .collect();
+        Ok(crate::results::EventPage {
+            rows,
+            next_cursor,
+            total: None,
+        })
     }
 
     /// Summaries of the given events, by id. Lists of constants go through
@@ -1270,29 +1332,40 @@ impl Store {
         &self,
         rule_id: &str,
         window: &crate::results::Window,
-    ) -> Result<Vec<crate::results::MatchRow>, StoreError> {
+    ) -> Result<crate::results::EventPage, StoreError> {
+        let mut params = vec![Value::Text(rule_id.to_owned())];
+        params.extend(Self::scope_params(window)?);
+        params.extend(Self::search_params(&window.search));
+        let continuation = Self::page_filter(window, &mut params);
         let sql = format!(
             "SELECT {MATCH_SUMMARY_COLUMNS}, e.matched_fields FROM rule_matches e
-             WHERE e.rule_id = ? {type_filter} {filter}
+             WHERE e.rule_id = ? {type_filter} {filter} {continuation}
              {order}
-             LIMIT ? OFFSET ?",
+             LIMIT ?",
             type_filter = Self::scope_filter(window, MATCH_TYPE_FILTER),
             filter = Self::search_filter(&window.search),
             order = Self::order_by(window.newest_first),
         );
-        let mut params = vec![Value::Text(rule_id.to_owned())];
-        params.extend(Self::scope_params(window)?);
-        params.extend(Self::search_params(&window.search));
         params.push(Value::UBigInt(window.page_limit()));
-        params.push(Value::UBigInt(window.offset));
         let types = self.file_log_types()?;
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params_from_iter(params))?;
         let mut out = Vec::new();
+        let mut last_time = None;
         while let Some(row) = rows.next()? {
-            out.push(Self::read_summary(row, &types, row.get(17)?)?.row);
+            let summary = Self::read_summary(row, &types, row.get(17)?)?;
+            last_time = summary.time_micros;
+            out.push(summary.row);
         }
-        Ok(out)
+        let next_cursor = out.last().map(|row| crate::results::EventCursor {
+            event_id: row.event_id.to_string(),
+            time_micros: last_time.map(|us| us.to_string()),
+        });
+        Ok(crate::results::EventPage {
+            rows: out,
+            next_cursor,
+            total: None,
+        })
     }
 
     /// A rule's matches under the window's type, range and search, for the

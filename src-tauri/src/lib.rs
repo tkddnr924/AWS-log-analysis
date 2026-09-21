@@ -18,26 +18,32 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 use time::{OffsetDateTime, PrimitiveDateTime};
 
-/// Tracks the single in-flight parse. Only one may run per process: the case
-/// directory, the store and the cancel flag are all per-run.
-#[derive(Default)]
-struct ParseSlot(Mutex<Option<Arc<AtomicBool>>>);
+/// Tracks the single in-flight scan of a case — a parse, a rule evaluation
+/// or a draft count. Only one may run per process: the case directory, the
+/// store and the cancel flag are all per-run, and they write one database.
+///
+/// Cloning shares the slot, so every clone of `AppState` sees one claim.
+#[derive(Clone, Default)]
+struct ParseSlot(Arc<Mutex<Option<Arc<AtomicBool>>>>);
 
 impl ParseSlot {
-    /// Claims the slot. `None` means a parse is already running — refusing is
+    /// Claims the slot. `None` means one is already running — refusing is
     /// the only safe answer, since overwriting would strand the first run's
     /// cancel flag where `cancel` can no longer reach it.
     ///
     /// The returned guard frees the slot on drop, so an early `?` or a panic
     /// inside the worker cannot leave it claimed forever.
-    fn begin(&self) -> Option<ParseRun<'_>> {
+    fn begin(&self) -> Option<ParseRun> {
         let mut slot = self.0.lock();
         if slot.is_some() {
             return None;
         }
         let flag = Arc::new(AtomicBool::new(false));
         *slot = Some(flag.clone());
-        Some(ParseRun { slot: self, flag })
+        Some(ParseRun {
+            slot: self.clone(),
+            flag,
+        })
     }
 
     /// Cooperative cancel; a no-op when nothing is running.
@@ -47,6 +53,9 @@ impl ParseSlot {
         }
     }
 }
+
+/// Refusal when the slot is taken. The parse and every rule scan share it.
+const SLOT_BUSY: &str = "파싱 또는 룰 평가가 진행 중입니다";
 
 /// An event id crossing IPC. Ids are `(file_id << 32) | record_index`, so
 /// anything past the first file exceeds u32. specta refuses u64, and the
@@ -61,13 +70,23 @@ impl specta::Type for EventId {
     }
 }
 
-/// Holds the parse slot for as long as one run is in flight.
-struct ParseRun<'a> {
-    slot: &'a ParseSlot,
+/// Holds the slot for as long as one run is in flight. A worker owns its
+/// guard, so the slot frees when the worker itself exits — not when the IPC
+/// future that spawned it is dropped while the work goes on.
+struct ParseRun {
+    slot: ParseSlot,
     flag: Arc<AtomicBool>,
 }
 
-impl Drop for ParseRun<'_> {
+impl ParseRun {
+    /// The predicate core scans poll to stop early.
+    fn cancelled(&self) -> impl Fn() -> bool {
+        let flag = self.flag.clone();
+        move || flag.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ParseRun {
     fn drop(&mut self) {
         *self.slot.0.lock() = None;
     }
@@ -178,7 +197,7 @@ impl StoreCache {
 #[derive(Clone)]
 struct AppState {
     cases_root: CasesRoot,
-    parse: Arc<ParseSlot>,
+    parse: ParseSlot,
     stores: Arc<StoreCache>,
 }
 
@@ -378,14 +397,14 @@ async fn start_parse(
 ) -> Result<ParseResult, String> {
     let mapping = build_map(&mapping);
     let state = state.inner().clone();
-    // Held for the whole command: dropping it frees the slot on every exit
-    // path, including the `?` below and a panic in the worker.
+    // Claimed before the worker spawns and moved into it below: the slot
+    // frees when the parse itself stops, not when this future is dropped.
     let Some(run) = state.parse.begin() else {
         return Err("이미 파싱이 진행 중입니다".to_owned());
     };
-    let cancel = run.flag.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let cancel = run.flag.clone();
         let input = PathBuf::from(&path);
         let now = OffsetDateTime::now_utc();
         let started = PrimitiveDateTime::new(now.date(), now.time());
@@ -527,35 +546,58 @@ fn register_rules(store: &mut Store, user_dir: &Path, case_dir: &Path) -> Result
     Ok(set.rules().len())
 }
 
+/// Claims the shared slot for a rule scan, then signals `started`.
+///
+/// The order is the contract with the UI: the claim stands before the caller
+/// hears the scan began, so a `cancel_parse` sent on leaving the results view
+/// always finds this run. Nothing can be lost between `invoke` and the
+/// worker spawning.
+fn begin_rule_scan(
+    slot: &ParseSlot,
+    started: impl FnOnce() -> Result<(), String>,
+) -> Result<ParseRun, String> {
+    let run = slot.begin().ok_or_else(|| SLOT_BUSY.to_owned())?;
+    started()?;
+    Ok(run)
+}
+
 /// Runs one rule over the case and stores its matches. Holds the parse
-/// slot: it writes to the same database a parse would.
+/// slot: it writes to the same database a parse would. `started` fires once
+/// that slot is held, telling the UI a cancel will now land.
 #[tauri::command]
 #[specta::specta]
 async fn evaluate_rule(
     state: tauri::State<'_, AppState>,
     case_id: String,
     rule_id: String,
+    started: tauri::ipc::Channel<()>,
 ) -> Result<u32, String> {
     let state = state.inner().clone();
+    let run = begin_rule_scan(&state.parse, || started.send(()).map_err(|e| e.to_string()))?;
     tauri::async_runtime::spawn_blocking(move || {
-        evaluate_rule_in(&state, &case_id, &rule_id).map(|hits| hits as u32)
+        // The guard moves into the worker, so the slot frees when the scan
+        // stops — a cancelled evaluation never blocks the next parse.
+        evaluate_rule_in(&state, &case_id, &rule_id, run.cancelled()).map(|hits| hits as u32)
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-fn evaluate_rule_in(state: &AppState, case_id: &str, rule_id: &str) -> Result<u64, String> {
-    let _run = state
-        .parse
-        .begin()
-        .ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
+/// Scans the case for one rule. The slot claim belongs to the caller: it
+/// has to be held from before the worker spawns until the worker exits.
+fn evaluate_rule_in(
+    state: &AppState,
+    case_id: &str,
+    rule_id: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<u64, String> {
     let set =
         RuleSet::load_layered(&state.cases_root.user_rules_dir()).map_err(|e| e.to_string())?;
     let rule = set
         .rule(rule_id)
         .ok_or_else(|| format!("룰을 찾을 수 없습니다: {rule_id}"))?;
     let mut store = state.store(case_id)?;
-    results::evaluate_rule(&mut store, rule).map_err(|e| e.to_string())
+    results::evaluate_rule(&mut store, rule, cancelled).map_err(|e| e.to_string())
 }
 
 /// Lists rule groups and totals for a case. The window's log type and date
@@ -613,8 +655,8 @@ fn query_results_in(
     results::query(&store, window).map_err(|e| e.to_string())
 }
 
-/// One page of a rule's matches. Served from the match table alone, so a
-/// page costs the same on a 300M-event case as on a small one.
+/// One cursor page of a rule's matches, read from the match table alone.
+/// The filtered count is computed only for the first page.
 #[tauri::command]
 #[specta::specta]
 async fn query_rule_matches(
@@ -747,10 +789,7 @@ async fn save_rule(
 }
 
 fn save_rule_in(state: &AppState, case_id: &str, source: &str) -> Result<String, String> {
-    let _run = state
-        .parse
-        .begin()
-        .ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
+    let _run = state.parse.begin().ok_or_else(|| SLOT_BUSY.to_owned())?;
     let user_dir = state.cases_root.user_rules_dir();
     let rule_id = write_user_rule(&user_dir, source)?;
     let set = RuleSet::load_layered(&user_dir).map_err(|e| e.to_string())?;
@@ -786,10 +825,7 @@ async fn delete_rule(
 }
 
 fn delete_rule_in(state: &AppState, case_id: &str, rule_id: &str) -> Result<(), String> {
-    let _run = state
-        .parse
-        .begin()
-        .ok_or("파싱 또는 룰 평가가 진행 중입니다")?;
+    let _run = state.parse.begin().ok_or_else(|| SLOT_BUSY.to_owned())?;
     let user_dir = state.cases_root.user_rules_dir();
     let path = user_rule_path(&user_dir, rule_id)?;
     if path.is_file() {
@@ -852,31 +888,45 @@ fn explain_rule(source: String) -> Result<RuleOutline, RuleProblem> {
 }
 
 /// Events a draft rule would match, without saving it or disturbing the
-/// case's recorded matches.
+/// case's recorded matches. A trial run scans the case, so it takes the same
+/// slot as an evaluation and stops on the same cancel; `started` fires once
+/// the slot is held.
 #[tauri::command]
 #[specta::specta]
 async fn count_rule_matches(
     state: tauri::State<'_, AppState>,
     case_id: String,
     source: String,
+    started: tauri::ipc::Channel<()>,
 ) -> Result<RuleHits, String> {
     let state = state.inner().clone();
+    let run = begin_rule_scan(&state.parse, || started.send(()).map_err(|e| e.to_string()))?;
     tauri::async_runtime::spawn_blocking(move || {
-        let set = RuleSet::from_source(&source).map_err(|e| e.to_string())?;
-        let store = state.store(&case_id)?;
-        let count = results::count_matches(&store, &set).map_err(|e| e.to_string())?;
-        Ok(RuleHits {
-            hits: count.hits as u32,
-            total: count.scanned as u32,
-        })
+        count_rule_matches_in(&state, &case_id, &source, run.cancelled())
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+/// Counts a draft's matches under the caller's slot claim.
+fn count_rule_matches_in(
+    state: &AppState,
+    case_id: &str,
+    source: &str,
+    cancelled: impl Fn() -> bool,
+) -> Result<RuleHits, String> {
+    let set = RuleSet::from_source(source).map_err(|e| e.to_string())?;
+    let store = state.store(case_id)?;
+    let count = results::count_matches(&store, &set, cancelled).map_err(|e| e.to_string())?;
+    Ok(RuleHits {
+        hits: count.hits as u32,
+        total: count.scanned as u32,
+    })
+}
+
 /// A trial run's result: matches out of everything scanned, so the editor can
 /// show the hit count as a proportion instead of a bare number.
-#[derive(Clone, Copy, serde::Serialize, specta::Type)]
+#[derive(Clone, Copy, Debug, serde::Serialize, specta::Type)]
 struct RuleHits {
     hits: u32,
     total: u32,
@@ -989,7 +1039,7 @@ struct CaseSummary {
     event_count: u32,
 }
 
-/// Cooperative cancel: the parse loop checks this between files and batches.
+/// Requests cooperative cancellation of the active parse, rule evaluation or draft count.
 #[tauri::command]
 #[specta::specta]
 fn cancel_parse(state: tauri::State<'_, AppState>) {
@@ -1151,7 +1201,7 @@ pub fn run() {
 
             app.manage(AppState {
                 cases_root: root.clone(),
-                parse: Arc::new(ParseSlot::default()),
+                parse: ParseSlot::default(),
                 stores: Arc::new(StoreCache::default()),
             });
             Ok(())
@@ -1163,11 +1213,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_mapping, delete_case_in, delete_rule_in, evaluate_rule_in, explain_rule,
-        fit_window, paths, preview_mapping, query_results_in, results, save_rule_in,
-        user_rule_path, write_user_rule, AppState, Arc, CasesRoot, Field, FieldPreview,
-        MappingEntry, OffsetDateTime, ParseSlot, Path, PrimitiveDateTime, RuleSet, Store,
-        StoreCache, MIN_WINDOW,
+        begin_rule_scan, count_rule_matches_in, default_mapping, delete_case_in, delete_rule_in,
+        evaluate_rule_in, explain_rule, fit_window, paths, preview_mapping, query_results_in,
+        results, save_rule_in, user_rule_path, write_user_rule, AppState, Arc, CasesRoot, Field,
+        FieldPreview, MappingEntry, OffsetDateTime, ParseSlot, Path, PrimitiveDateTime, RuleHits,
+        RuleSet, Store, StoreCache, MIN_WINDOW, SLOT_BUSY,
     };
     use std::sync::atomic::Ordering;
 
@@ -1293,7 +1343,7 @@ mod tests {
         let id = seed_case(&root);
         let state = AppState {
             cases_root: root,
-            parse: Arc::new(ParseSlot::default()),
+            parse: ParseSlot::default(),
             stores: Arc::new(StoreCache::default()),
         };
         (tmp, state, id)
@@ -1344,6 +1394,19 @@ mod tests {
         condition: $n
     }"#;
 
+    /// Runs a rule the way `evaluate_rule` does: claim the shared slot, scan
+    /// under that run's cancel flag, release when the scan returns.
+    fn scan_rule(state: &AppState, case_id: &str, rule_id: &str) -> Result<u64, String> {
+        let run = begin_rule_scan(&state.parse, || Ok(()))?;
+        evaluate_rule_in(state, case_id, rule_id, run.cancelled())
+    }
+
+    /// The draft-count path, claimed the same way.
+    fn count_draft(state: &AppState, case_id: &str, source: &str) -> Result<RuleHits, String> {
+        let run = begin_rule_scan(&state.parse, || Ok(()))?;
+        count_rule_matches_in(state, case_id, source, run.cancelled())
+    }
+
     #[test]
     fn saving_a_rule_registers_it_pending_and_selecting_evaluates_it() {
         let (_tmp, state, case_id) = seeded_case();
@@ -1370,7 +1433,7 @@ mod tests {
         assert_eq!(groups[0].rule_id, "my_hit");
         assert!(!groups[0].evaluated, "saving must not scan the case");
 
-        let hits = evaluate_rule_in(&state, &case_id, "my_hit").unwrap();
+        let hits = scan_rule(&state, &case_id, "my_hit").unwrap();
 
         assert_eq!(hits, 1);
         let groups = state
@@ -1424,7 +1487,7 @@ mod tests {
     fn deleting_a_rule_removes_it_from_the_case_and_the_snapshot() {
         let (_tmp, state, case_id) = seeded_case();
         save_rule_in(&state, &case_id, HIT).unwrap();
-        evaluate_rule_in(&state, &case_id, "my_hit").unwrap();
+        scan_rule(&state, &case_id, "my_hit").unwrap();
 
         delete_rule_in(&state, &case_id, "my_hit").unwrap();
 
@@ -1455,7 +1518,7 @@ mod tests {
         )
         .unwrap();
 
-        let hits = evaluate_rule_in(&state, &case_id, "my_miss").unwrap();
+        let hits = scan_rule(&state, &case_id, "my_miss").unwrap();
 
         assert_eq!(hits, 0);
         let groups = state
@@ -1551,13 +1614,135 @@ mod tests {
     }
 
     #[test]
-    fn rule_evaluation_is_refused_while_a_parse_holds_the_slot() {
+    fn rule_work_is_refused_while_a_parse_holds_the_slot() {
         let (_tmp, state, case_id) = seeded_case();
+        save_rule_in(&state, &case_id, HIT).unwrap();
         let _parse = state.parse.begin().unwrap();
 
-        // Both write the same database, so they must not overlap.
-        assert!(evaluate_rule_in(&state, &case_id, "x").is_err());
+        // All three write or scan the same database, so they must not overlap.
+        assert_eq!(
+            scan_rule(&state, &case_id, "my_hit").unwrap_err(),
+            SLOT_BUSY
+        );
+        assert_eq!(count_draft(&state, &case_id, HIT).unwrap_err(), SLOT_BUSY);
         assert!(save_rule_in(&state, &case_id, HIT).is_err());
+    }
+
+    /// Leaving the results view mid-evaluation: the rule must not be recorded
+    /// as done, must keep no partial matches, and a later run must be whole.
+    #[test]
+    fn a_cancelled_rule_scan_stays_unevaluated_and_a_retry_starts_fresh() {
+        let (_tmp, state, case_id) = seeded_case();
+        save_rule_in(&state, &case_id, HIT).unwrap();
+
+        let cancelled = {
+            let run = begin_rule_scan(&state.parse, || Ok(())).unwrap();
+            state.parse.cancel();
+            evaluate_rule_in(&state, &case_id, "my_hit", run.cancelled())
+        };
+
+        assert!(cancelled.is_err(), "a cancelled scan must not report hits");
+        let groups = state
+            .store(&case_id)
+            .unwrap()
+            .rule_groups(&Default::default())
+            .unwrap();
+        assert!(!groups[0].evaluated, "an interrupted rule is not evaluated");
+        assert_eq!(groups[0].match_count, 0, "partial hits must be discarded");
+
+        assert_eq!(scan_rule(&state, &case_id, "my_hit").unwrap(), 1);
+        let groups = state
+            .store(&case_id)
+            .unwrap()
+            .rule_groups(&Default::default())
+            .unwrap();
+        assert!(groups[0].evaluated);
+        assert_eq!(groups[0].match_count, 1);
+    }
+
+    /// The next parse may start only once the worker that held the slot is
+    /// gone, and it must be able to start then.
+    #[test]
+    fn a_cancelled_scan_frees_the_slot_when_its_worker_exits() {
+        let (_tmp, state, case_id) = seeded_case();
+        save_rule_in(&state, &case_id, HIT).unwrap();
+        let (entered, worker_entered) = std::sync::mpsc::channel();
+        let (resume, worker_resume) = std::sync::mpsc::channel();
+
+        let run = begin_rule_scan(&state.parse, || Ok(())).unwrap();
+        let worker_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            worker_resume.recv().unwrap();
+            // The guard is owned here, so the slot is held until this returns.
+            evaluate_rule_in(&worker_state, &case_id, "my_hit", run.cancelled())
+        });
+
+        worker_entered.recv().unwrap();
+        state.parse.cancel();
+        assert!(
+            state.parse.begin().is_none(),
+            "the slot stays claimed while the worker runs"
+        );
+        resume.send(()).unwrap();
+        let outcome = worker.join().unwrap();
+
+        assert!(outcome.is_err(), "the scan must report the cancellation");
+        assert!(
+            state.parse.begin().is_some(),
+            "a new parse may start once the worker is gone"
+        );
+    }
+
+    /// The UI cancels by calling `cancel_parse` when it leaves the results
+    /// view. That cancel must not be able to fall between `invoke` and the
+    /// scan registering, so the claim stands before `started` is signalled.
+    #[test]
+    fn the_start_signal_fires_only_after_the_slot_claim_stands() {
+        let (_tmp, state, _case_id) = seeded_case();
+
+        let run = begin_rule_scan(&state.parse, || {
+            // What the frontend may do the instant it hears `started`.
+            assert!(state.parse.begin().is_none(), "claim must already stand");
+            state.parse.cancel();
+            Ok(())
+        })
+        .unwrap();
+
+        let cancelled = run.cancelled();
+        assert!(
+            cancelled(),
+            "a cancel racing the signal must reach this run"
+        );
+    }
+
+    #[test]
+    fn a_scan_whose_start_signal_fails_holds_nothing() {
+        let (_tmp, state, _case_id) = seeded_case();
+
+        // A broken channel means the caller could never cancel this scan, so
+        // it must not run at all.
+        let refused = begin_rule_scan(&state.parse, || Err("채널이 끊어졌습니다".to_owned()));
+
+        assert!(refused.is_err());
+        assert!(state.parse.begin().is_some(), "the slot must be free again");
+    }
+
+    /// A draft count scans the case too, so it shares the slot and stops on
+    /// the same cancel; closing the results view drops drafts as well.
+    #[test]
+    fn a_draft_count_shares_the_slot_and_stops_when_cancelled() {
+        let (_tmp, state, case_id) = seeded_case();
+
+        let cancelled = {
+            let run = begin_rule_scan(&state.parse, || Ok(())).unwrap();
+            state.parse.cancel();
+            count_rule_matches_in(&state, &case_id, HIT, run.cancelled())
+        };
+
+        assert!(cancelled.is_err(), "a cancelled count must not report hits");
+        let hits = count_draft(&state, &case_id, HIT).unwrap();
+        assert_eq!((hits.hits, hits.total), (1, 1));
     }
 
     #[test]

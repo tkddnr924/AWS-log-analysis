@@ -14,7 +14,6 @@ fn main() {
         let page = results::all_events(
             &store,
             &Window {
-                offset: 0,
                 limit: 1000,
                 search: search.to_owned(),
                 newest_first: newest,
@@ -23,7 +22,7 @@ fn main() {
         )
         .expect("query");
         println!(
-            "all_events search={search:?} newest={newest} rows={} total={} {:?}",
+            "all_events search={search:?} newest={newest} rows={} total={:?} {:?}",
             page.rows.len(),
             page.total,
             t.elapsed()
@@ -44,7 +43,6 @@ fn main() {
             &store,
             &g.rule_id,
             &Window {
-                offset: 0,
                 limit: 1000,
                 ..Default::default()
             },

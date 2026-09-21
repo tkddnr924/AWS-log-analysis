@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   commands,
+  type EventCursor,
   type FieldPreview,
   type MatchRow,
   type ResultPage,
@@ -43,7 +44,14 @@ function isBadBound(typed: string): boolean {
 
 /** FR-6 results window: rule groups on the left, their matches on the right. */
 export function Results({ caseId }: { caseId: string }) {
-  const { reset, go, work } = useApp();
+  const { reset, go, work, evaluateRule } = useApp();
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const [page, setPage] = useState<ResultPage | null>(null);
   const [selected, setSelected] = useState<string>(ALL_EVENTS);
   // One `files.log_type`. Scopes the rule list, the counts and the event
@@ -70,11 +78,11 @@ export function Results({ caseId }: { caseId: string }) {
   // Everything the backend narrows on, apart from paging and search.
   const scope = { log_type: logType, from: from || null, to: to || null };
   const pageWindow = (
-    offset: number,
+    after: EventCursor | null,
     search: string,
     newestFirst: boolean,
   ): Window => ({
-    offset,
+    after,
     limit: PAGE,
     search,
     newest_first: newestFirst,
@@ -103,6 +111,7 @@ export function Results({ caseId }: { caseId: string }) {
   const generation = useRef(0);
   const [matches, setMatches] = useState<MatchRow[]>([]);
   const [total, setTotal] = useState(0);
+  const [nextCursor, setNextCursor] = useState<EventCursor | null>(null);
   // True between issuing the first page and its arrival, so an empty list
   // is not announced as "0건" while the query is still running.
   const [rowsLoading, setRowsLoading] = useState(true);
@@ -141,7 +150,7 @@ export function Results({ caseId }: { caseId: string }) {
     // groups and could reset a valid selection.
     let stale = false;
     // No search here: the sidebar counts describe each rule, not the filter.
-    commands.queryResults(caseId, pageWindow(0, "", false)).then((r) => {
+    commands.queryResults(caseId, pageWindow(null, "", false)).then((r) => {
       if (stale) return;
       if (r.status === "error") return fail(r.error);
       setFilterError(null);
@@ -196,39 +205,41 @@ export function Results({ caseId }: { caseId: string }) {
     const group = page.groups.find((g) => g.rule_id === selected);
     if (!group || group.evaluated) return;
     setEvaluating(selected);
-    commands.evaluateRule(caseId, selected).then((r) => {
-      if (r.status === "error") {
-        setFailed({ ruleId: selected, error: r.error });
-        setEvaluating(null);
-        return;
-      }
+    evaluateRule(caseId, selected).then(() => {
+      if (!mounted.current) return;
       // `evaluating` clears when the reloaded page lands (sidebar effect):
       // clearing it here, with the stale page still showing the rule as
       // pending, would start the same evaluation a second time.
       setVersion((v) => v + 1);
+    }).catch((error: unknown) => {
+      if (!mounted.current) return;
+      setFailed({ ruleId: selected, error: String(error) });
+      setEvaluating(null);
     });
-  }, [page, selected, evaluating, failed, caseId]);
+  }, [page, selected, evaluating, failed, caseId, evaluateRule]);
 
   useEffect(() => {
     setMatches([]);
+    setNextCursor(null);
     setRowsLoading(true);
     const run = ++generation.current;
     if (!rowsReady) return;
     const request =
       selected === ALL_EVENTS
-        ? commands.queryEvents(caseId, pageWindow(0, search, newestFirst))
+        ? commands.queryEvents(caseId, pageWindow(null, search, newestFirst))
         : commands.queryRuleMatches(
             caseId,
             selected,
-            pageWindow(0, search, newestFirst),
+            pageWindow(null, search, newestFirst),
           );
     request.then((r) => {
       if (run !== generation.current) return;
       setRowsLoading(false);
       if (r.status === "error") return fail(r.error);
       setFilterError(null);
+      setNextCursor(r.data.next_cursor);
       setMatches(r.data.rows);
-      setTotal(r.data.total);
+      if (r.data.total !== null) setTotal(r.data.total);
     });
   }, [
     caseId,
@@ -255,7 +266,8 @@ export function Results({ caseId }: { caseId: string }) {
     // length through a setState updater, which React does not always run
     // eagerly — when it did not, paging stopped after the first page.
     const offset = matches.length;
-    if (loading.current || reevaluating || offset >= shownTotal) return;
+    const after = nextCursor;
+    if (loading.current || rowsLoading || reevaluating || offset >= shownTotal || !after) return;
     const run = generation.current;
     loading.current = true;
     try {
@@ -263,19 +275,20 @@ export function Results({ caseId }: { caseId: string }) {
         selected === ALL_EVENTS
           ? await commands.queryEvents(
               caseId,
-              pageWindow(offset, search, newestFirst),
+              pageWindow(after, search, newestFirst),
             )
           : await commands.queryRuleMatches(
               caseId,
               selected,
-              pageWindow(offset, search, newestFirst),
+              pageWindow(after, search, newestFirst),
             );
       // A page that arrived after the user switched rules, searched or
       // reversed the order belongs to the previous list; appending it would
       // interleave two different queries.
       if (run !== generation.current) return;
       if (rows.status === "error") return fail(rows.error);
-      // Offset was captured before the await; ignore a stale response.
+      setNextCursor(rows.data.next_cursor);
+      // The generation owns both this cursor and the rows it follows.
       setMatches((prev) =>
         prev.length === offset ? [...prev, ...rows.data.rows] : prev,
       );
@@ -287,7 +300,9 @@ export function Results({ caseId }: { caseId: string }) {
     selected,
     shownTotal,
     matches.length,
+    nextCursor,
     reevaluating,
+    rowsLoading,
     search,
     newestFirst,
     logType,
@@ -352,13 +367,12 @@ export function Results({ caseId }: { caseId: string }) {
         <h1>분석 결과</h1>
         <code>{caseId}</code>
         <span className="grow" />
-        {/* Plain navigation always works; `reset` refuses while a parse
-            runs, which would otherwise strand the user on this screen. */}
+        {/* Leaving results cancels its rule scan; parsing remains independent. */}
         <button onClick={() => go("start")}>시작 화면</button>
         <button
           onClick={reset}
-          disabled={work !== "idle"}
-          title={work === "idle" ? undefined : "파싱이 끝난 뒤에 가능합니다"}
+          disabled={work !== "idle" && work !== "evaluating"}
+          title={work === "parsing" ? "파싱이 끝난 뒤에 가능합니다" : undefined}
         >
           새 로그 가져오기
         </button>

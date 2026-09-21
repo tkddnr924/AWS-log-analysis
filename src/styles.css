@@ -2463,6 +2463,7 @@ button.primary:hover:not(:disabled) {
 
 /* The textarea remains the real editor. The pre directly behind it mirrors
    every character; both layers have identical metrics and scroll offsets. */
+/* Token colors must not change glyph metrics relative to the plain textarea. */
 .rule-highlight,
 .rule-source {
   position: absolute;
@@ -2508,7 +2509,6 @@ button.primary:hover:not(:disabled) {
 
 .syntax-keyword {
   color: #c69cff;
-  font-weight: 650;
 }
 
 .syntax-field {
@@ -2517,7 +2517,6 @@ button.primary:hover:not(:disabled) {
 
 .syntax-variable {
   color: #58a6ff;
-  font-weight: 600;
 }
 
 .syntax-string {
@@ -2530,7 +2529,6 @@ button.primary:hover:not(:disabled) {
 
 .syntax-operator {
   color: #ffbd73;
-  font-weight: 600;
 }
 
 .syntax-literal,
@@ -2540,7 +2538,6 @@ button.primary:hover:not(:disabled) {
 
 .syntax-comment {
   color: #68758b;
-  font-style: italic;
 }
 
 .editor-side {

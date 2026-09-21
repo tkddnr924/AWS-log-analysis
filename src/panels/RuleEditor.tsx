@@ -326,7 +326,16 @@ export function RuleEditor({
   // The mapping the app already loaded at startup: the palette needs the
   // column names, and fetching them again per editor open would leave the
   // field group empty on first paint.
-  const { mapping } = useApp();
+  const { mapping, countRuleMatches, cancelRule } = useApp();
+  const countActive = useRef(false);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      if (countActive.current) void cancelRule();
+    };
+  }, [cancelRule]);
   const area = useRef<HTMLTextAreaElement>(null);
   const pendingSelection = useRef<[start: number, end: number] | null>(null);
   const highlight = useRef<HTMLPreElement>(null);
@@ -503,16 +512,20 @@ export function RuleEditor({
   // large case this walks every event. `counting` also keeps a second scan
   // from starting while one is in flight.
   const count = async () => {
-    if (counting) return;
+    if (countActive.current) return;
     const asked = source;
+    countActive.current = true;
     setCounting(true);
-    const r = await commands.countRuleMatches(caseId, asked);
-    setCounting(false);
-    // Typing while the scan ran means this number answers text that no longer
-    // exists; showing it would label the new rule with the old rule's count.
-    if (counted.current !== asked) return;
-    if (r.status === "error") return setError(r.error);
-    setHits(r.data);
+    try {
+      const hits = await countRuleMatches(caseId, asked);
+      if (!mounted.current || counted.current !== asked) return;
+      setHits(hits);
+    } catch (error) {
+      if (mounted.current) setError(String(error));
+    } finally {
+      countActive.current = false;
+      if (mounted.current) setCounting(false);
+    }
   };
 
   // One chip: click inserts at the caret; drag drops it where it lands.
@@ -657,6 +670,8 @@ export function RuleEditor({
                   aria-hidden="true"
                 >
                   {highlightRule(source, errorLine)}
+                  {/* A pre drops its final empty line; the textarea keeps it. */}
+                  {source.endsWith("\n") ? " " : null}
                 </pre>
                 <textarea
                   ref={area}
@@ -664,6 +679,7 @@ export function RuleEditor({
                   value={source}
                   spellCheck={false}
                   autoComplete="off"
+                  wrap="off"
                   aria-label="룰 정의"
                   onScroll={(e) => {
                     if (highlight.current) {

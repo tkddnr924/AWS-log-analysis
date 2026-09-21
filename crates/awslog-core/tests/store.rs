@@ -3,7 +3,8 @@
 mod support;
 
 use awslog_core::model::NormalizedEvent;
-use awslog_core::store::{CaseStatus, Store};
+use awslog_core::store::{CaseStatus, Store, StoreError};
+use std::sync::atomic::{AtomicU64, Ordering};
 use time::macros::datetime;
 
 fn event(index: u64, name: &str) -> NormalizedEvent {
@@ -53,6 +54,34 @@ fn appends_events_in_batches_and_counts_them() {
     store.append_events(&batch).unwrap();
 
     assert_eq!(store.event_count(&Default::default()).unwrap(), 5_000);
+}
+
+#[test]
+fn a_cancelled_scan_stops_at_the_row_the_cancel_lands_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "case-1", "/logs").unwrap();
+    store
+        .register_file(1, "a.json.gz", 1234, "cloudtrail")
+        .unwrap();
+    let batch: Vec<_> = (0..5).map(|i| event(i, "ConsoleLogin")).collect();
+    store.append_events(&batch).unwrap();
+    let seen = AtomicU64::new(0);
+
+    let err = store
+        .scan_events(
+            None,
+            |_| true,
+            |_, _, _| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            },
+            || seen.load(Ordering::Relaxed) >= 2,
+        )
+        .unwrap_err();
+
+    // Stopping only at the end of the file would keep a cancelled run
+    // reading the whole case.
+    assert!(matches!(err, StoreError::Cancelled));
+    assert_eq!(seen.load(Ordering::Relaxed), 2);
 }
 
 // getrusage is unix-only; the invariant is platform-independent so measuring

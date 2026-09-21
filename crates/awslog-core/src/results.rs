@@ -10,8 +10,8 @@ use crate::store::{Store, StoreError};
 /// one object so the commands do not grow a parameter per filter.
 #[derive(Debug, Clone, Default, Deserialize, Type)]
 pub struct Window {
-    #[specta(type = u32)]
-    pub offset: u64,
+    /// Continue after the previous page; reset when filters or order change.
+    pub after: Option<EventCursor>,
     #[specta(type = u32)]
     pub limit: u64,
     /// Case-insensitive substring over the columns the table shows. Empty
@@ -36,6 +36,14 @@ impl Window {
     pub fn page_limit(&self) -> u64 {
         self.limit.clamp(1, 1_000)
     }
+}
+
+/// Exact sort key, separate from the millisecond KST display value.
+/// Strings preserve the full database precision across JavaScript IPC.
+#[derive(Debug, Clone, Deserialize, Serialize, Type)]
+pub struct EventCursor {
+    pub event_id: String,
+    pub time_micros: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
@@ -137,10 +145,11 @@ pub fn query(store: &Store, window: &Window) -> Result<ResultPage, StoreError> {
 #[derive(Debug, Clone, Serialize, Type, Default)]
 pub struct EventPage {
     pub rows: Vec<MatchRow>,
-    /// Rows matching the filter. Paging needs this, or the list stops short
-    /// of the filtered set or asks for pages that do not exist.
-    #[specta(type = u32)]
-    pub total: u64,
+    /// Exact filtered count on the first page; continuations do not recount.
+    #[specta(type = Option<f64>)]
+    pub total: Option<u64>,
+    /// Last returned sort key, or `None` when this page is empty.
+    pub next_cursor: Option<EventCursor>,
 }
 
 /// Pages one rule's matches. The total is the filtered count: the number
@@ -151,10 +160,11 @@ pub fn rule_matches(
     rule_id: &str,
     window: &Window,
 ) -> Result<EventPage, StoreError> {
-    Ok(EventPage {
-        rows: store.rule_matches(rule_id, window)?,
-        total: store.rule_match_count(rule_id, window)?,
-    })
+    let mut page = store.rule_matches(rule_id, window)?;
+    if window.after.is_none() {
+        page.total = Some(store.rule_match_count(rule_id, window)?);
+    }
+    Ok(page)
 }
 
 /// One JSON path seen inside a payload column while parsing, and how many
@@ -176,10 +186,11 @@ pub fn payload_keys(store: &Store, log_type: Option<&str>) -> Result<Vec<Payload
 
 /// Pages every event regardless of rules.
 pub fn all_events(store: &Store, window: &Window) -> Result<EventPage, StoreError> {
-    Ok(EventPage {
-        rows: store.all_events(window)?,
-        total: store.event_count_matching(window)?,
-    })
+    let mut page = store.all_events(window)?;
+    if window.after.is_none() {
+        page.total = Some(store.event_count_matching(window)?);
+    }
+    Ok(page)
 }
 
 /// A trial run: events a rule set would match, and how many were scanned.
@@ -195,19 +206,31 @@ pub struct MatchCount {
 /// is still being written: persisting a trial run would leave a half-finished
 /// rule in the case's results. `scanned` comes from the same pass so the
 /// answer can be read as a proportion without a second query.
-pub fn count_matches(store: &Store, set: &crate::rule::RuleSet) -> Result<MatchCount, StoreError> {
+///
+/// `cancelled` abandons the pass; a half-counted draft is no answer, so it
+/// reports [`StoreError::Cancelled`] rather than a partial total.
+pub fn count_matches(
+    store: &Store,
+    set: &crate::rule::RuleSet,
+    cancelled: impl Fn() -> bool,
+) -> Result<MatchCount, StoreError> {
     let mut count = MatchCount {
         hits: 0,
         scanned: 0,
     };
-    store.for_each_typed_event(|_, log_type, event| {
-        count.scanned += 1;
-        // One view per event, reused across rules: building it per rule was
-        // the hot path the streaming evaluator already avoids.
-        if crate::rule::evaluate_any(set.for_log_type(log_type), &event) {
-            count.hits += 1;
-        }
-    })?;
+    store.scan_events(
+        None,
+        |_| true,
+        |_, log_type, event| {
+            count.scanned += 1;
+            // One view per event, reused across rules: building it per rule was
+            // the hot path the streaming evaluator already avoids.
+            if crate::rule::evaluate_any(set.for_log_type(log_type), &event) {
+                count.hits += 1;
+            }
+        },
+        cancelled,
+    )?;
     Ok(count)
 }
 
@@ -215,21 +238,58 @@ pub fn count_matches(store: &Store, set: &crate::rule::RuleSet) -> Result<MatchC
 /// evaluation). Reads only the columns the rule names and only the files
 /// whose log type it applies to, so a narrow rule over a large case costs a
 /// fraction of a full pass.
-pub fn evaluate_rule(store: &mut Store, rule: &crate::rule::Rule) -> Result<u64, StoreError> {
+///
+/// `cancelled` stops the run mid-scan. A run that did not finish leaves the
+/// rule pending with no hits: hits already written are dropped once the
+/// writer is gone, so the next attempt starts from scratch instead of
+/// resuming into a half-scanned result.
+pub fn evaluate_rule(
+    store: &mut Store,
+    rule: &crate::rule::Rule,
+    cancelled: impl Fn() -> bool,
+) -> Result<u64, StoreError> {
     store.reset_rule(rule)?;
     let set = crate::rule::RuleSet::single(rule.clone());
-    let mut writer = store.writer_handle()?;
-    let mut sink = |batch: &[(String, crate::rule::Hit)]| writer.append_match_batch(batch);
-    let mut streamer = crate::rule::MatchStreamer::new(&set, 10_000);
     let columns = rule.columns();
-    store.scan_events(
-        Some(&columns),
-        |log_type| rule.applies_to(log_type),
-        |id, log_type, event| streamer.push_for_log_type(id, log_type, &event, &mut sink),
-    )?;
-    let summary = streamer.finish(&mut sink).map_err(StoreError::RuleRun)?;
-    store.mark_rule_evaluated(&rule.id)?;
-    Ok(summary.rules.iter().map(|r| r.match_count).sum())
+    // The writer handle lives only for the scan: cleanup below must not run
+    // while anything can still append.
+    let run = {
+        let mut writer = store.writer_handle()?;
+        let mut sink = |batch: &[(String, crate::rule::Hit)]| writer.append_match_batch(batch);
+        let mut streamer = crate::rule::MatchStreamer::new(&set, 10_000);
+        let scan = store.scan_events(
+            Some(&columns),
+            |log_type| rule.applies_to(log_type),
+            |id, log_type, event| streamer.push_for_log_type(id, log_type, &event, &mut sink),
+            &cancelled,
+        );
+        // Only a completed scan flushes its tail; an abandoned run drops the
+        // hits it was still holding.
+        match scan {
+            Ok(()) => streamer
+                .finish(&mut sink)
+                .map_err(StoreError::RuleRun)
+                .and_then(|summary| {
+                    if cancelled() {
+                        Err(StoreError::Cancelled)
+                    } else {
+                        Ok(summary)
+                    }
+                }),
+            Err(e) => Err(e),
+        }
+    };
+    match run {
+        Ok(summary) => {
+            store.mark_rule_evaluated(&rule.id)?;
+            Ok(summary.rules.iter().map(|r| r.match_count).sum())
+        }
+        Err(e) => {
+            // Partial hits would read as a finished rule in the sidebar.
+            store.reset_rule(rule)?;
+            Err(e)
+        }
+    }
 }
 
 /// One event's stored columns for the detail view.

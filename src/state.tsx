@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isParseableLogType } from "./lib/format";
 import {
@@ -17,6 +18,7 @@ import {
   type DetectionRow,
   type ParseResult,
   type MappingEntry,
+  type RuleHits,
   type ScanSummary,
 } from "./bindings";
 
@@ -25,7 +27,13 @@ import {
 export type Screen = "start" | "parsing" | "results";
 
 /// What the backend is doing, independent of what is on screen.
-export type Work = "idle" | "scanning" | "detecting" | "parsing";
+export type Work =
+  | "idle"
+  | "scanning"
+  | "detecting"
+  | "parsing"
+  | "evaluating"
+  | "cancelling-rule";
 
 export type Progress = {
   done: number;
@@ -60,7 +68,17 @@ type State = {
   chooseDirectory: () => Promise<void>;
   startParse: () => Promise<void>;
   cancelParse: () => void;
+  evaluateRule: (caseId: string, ruleId: string) => Promise<number>;
+  countRuleMatches: (caseId: string, source: string) => Promise<RuleHits>;
+  cancelRule: () => Promise<void>;
   reset: () => void;
+};
+
+type RuleTask = {
+  started: Promise<void>;
+  finished: Promise<void>;
+  done: boolean;
+  stopping?: Promise<void>;
 };
 
 const Ctx = createContext<State | null>(null);
@@ -92,6 +110,75 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const workRef = useRef<Work>("idle");
   workRef.current = work;
 
+  const ruleTask = useRef<RuleTask | null>(null);
+
+  const runRule = useCallback(<T,>(start: (started: Channel<null>) => Promise<T>) => {
+    if (workRef.current !== "idle" || ruleTask.current) {
+      return Promise.reject(new Error("다른 작업이 진행 중입니다"));
+    }
+    const channel = new Channel<null>();
+    const started = new Promise<void>((resolve) => {
+      channel.onmessage = () => resolve();
+    });
+    workRef.current = "evaluating";
+    setWork("evaluating");
+    const response = start(channel);
+    const task: RuleTask = { started, finished: Promise.resolve(), done: false };
+    const finish = () => {
+      task.done = true;
+      if (ruleTask.current !== task) return;
+      ruleTask.current = null;
+      if (!task.stopping) {
+        workRef.current = "idle";
+        setWork("idle");
+      }
+    };
+    task.finished = response.then(finish, finish);
+    ruleTask.current = task;
+    return response;
+  }, []);
+
+  const cancelRule = useCallback((): Promise<void> => {
+    const task = ruleTask.current;
+    if (!task) return Promise.resolve();
+    if (task.stopping) return task.stopping;
+    workRef.current = "cancelling-rule";
+    setWork("cancelling-rule");
+    task.stopping = (async () => {
+      try {
+        // Cancellation must not arrive before the backend claims its slot.
+        await Promise.race([task.started, task.finished]);
+        if (!task.done) await commands.cancelParse();
+      } catch (error) {
+        setNotice(String(error));
+      } finally {
+        // The acknowledgement only sets a flag; the worker still owns the DB.
+        await task.finished;
+        workRef.current = "idle";
+        setWork("idle");
+      }
+    })();
+    return task.stopping;
+  }, []);
+
+  const evaluateRule = useCallback(
+    (id: string, ruleId: string) =>
+      runRule(async (started) => {
+        const result = await commands.evaluateRule(id, ruleId, started);
+        if (result.status === "error") throw new Error(result.error);
+        return result.data;
+      }),
+    [runRule],
+  );
+  const countRuleMatches = useCallback(
+    (id: string, source: string) =>
+      runRule(async (started) => {
+        const result = await commands.countRuleMatches(id, source, started);
+        if (result.status === "error") throw new Error(result.error);
+        return result.data;
+      }),
+    [runRule],
+  );
   // Subscribed for the whole app lifetime, not per screen: progress must keep
   // arriving while the user browses another screen.
   useEffect(() => {
@@ -142,9 +229,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   }, [resetMapping]);
 
   const chooseDirectory = useCallback(async () => {
-    // The backend parse keeps running regardless of what the UI does, so
-    // starting a new scan here would desync the two.
-    if (workRef.current === "parsing") return;
+    if (workRef.current !== "idle") return;
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked !== "string") return;
 
@@ -238,8 +323,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       mapping,
       setMapping,
       resetMapping,
-      go: setScreen,
+      go: (next) => {
+        if (next === "results" && workRef.current === "cancelling-rule") return;
+        if (next !== "results") void cancelRule();
+        setScreen(next);
+      },
       openCase: (id: string) => {
+        if (workRef.current === "cancelling-rule") return;
+        if (id !== caseId) void cancelRule();
         setCaseId(id);
         setScreen("results");
       },
@@ -248,7 +339,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         // A parse holds the store open; on Windows that fails the recursive
         // delete and leaves a half-removed directory behind.
         if (workRef.current !== "idle")
-          return setNotice("파싱 중에는 케이스를 삭제할 수 없습니다");
+          return setNotice("작업 중에는 케이스를 삭제할 수 없습니다");
         const r = await commands.deleteCase(id);
         if (r.status === "error") return setNotice(r.error);
         // Every route back into the deleted case has to go, or "결과 보기"
@@ -269,12 +360,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       setSelected,
       chooseDirectory,
       startParse,
+      evaluateRule,
+      countRuleMatches,
+      cancelRule,
       cancelParse: () => {
         void commands.cancelParse();
         setProgress((p) => (p ? { ...p, cancelRequested: true } : p));
       },
       reset: () => {
-        if (workRef.current === "parsing") return;
+        if (workRef.current !== "idle" && workRef.current !== "evaluating") return;
         runRef.current += 1;
         setRoot(null);
         setSummary(null);
@@ -284,6 +378,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
         setProgress(null);
         setWork("idle");
         setScreen("start");
+        void cancelRule();
       },
     }),
     [
@@ -303,6 +398,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       chooseDirectory,
       startParse,
       refreshCases,
+      evaluateRule,
+      countRuleMatches,
+      cancelRule,
     ],
   );
 

@@ -5,8 +5,9 @@ mod support;
 use awslog_core::model::NormalizedEvent;
 use awslog_core::results::{self, Window};
 use awslog_core::rule::{Hit, RuleSet};
-use awslog_core::store::Store;
+use awslog_core::store::{Store, StoreError};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use time::macros::datetime;
 
 fn event(id: u64, name: &str) -> NormalizedEvent {
@@ -92,7 +93,6 @@ fn paginates_matches_within_a_rule() {
         &store,
         "root_login",
         &Window {
-            offset: 0,
             limit: 100,
             ..Default::default()
         },
@@ -102,7 +102,7 @@ fn paginates_matches_within_a_rule() {
         &store,
         "root_login",
         &Window {
-            offset: 100,
+            after: first.next_cursor.clone(),
             limit: 100,
             ..Default::default()
         },
@@ -113,7 +113,8 @@ fn paginates_matches_within_a_rule() {
     assert_eq!(second.rows.len(), 100);
     // Pages must not overlap; the UI would show duplicates.
     assert_ne!(first.rows[0].event_id, second.rows[0].event_id);
-    assert_eq!(first.total, 250);
+    assert_eq!(first.total, Some(250));
+    assert_eq!(second.total, None);
 }
 
 #[test]
@@ -124,7 +125,6 @@ fn a_match_row_carries_the_evidence_and_a_summary() {
         &store,
         "root_login",
         &Window {
-            offset: 0,
             limit: 10,
             ..Default::default()
         },
@@ -266,7 +266,7 @@ fn rules_are_registered_unevaluated_and_evaluated_one_at_a_time() {
     assert_eq!(page.matched_events, 0);
 
     // One rule evaluated; the others stay pending.
-    let hits = results::evaluate_rule(&mut store, set.rule("login").unwrap()).unwrap();
+    let hits = results::evaluate_rule(&mut store, set.rule("login").unwrap(), || false).unwrap();
     assert_eq!(hits, 1);
     let page = results::query(&store, &Window::default()).unwrap();
     let login = page.groups.iter().find(|g| g.rule_id == "login").unwrap();
@@ -282,18 +282,18 @@ fn rules_are_registered_unevaluated_and_evaluated_one_at_a_time() {
     // Only the columns a rule names are read; a JSON-path rule still sees
     // its column. `seeded()` events carry no response, so use `get`.
     assert_eq!(
-        results::evaluate_rule(&mut store, set.rule("fail").unwrap()).unwrap(),
+        results::evaluate_rule(&mut store, set.rule("fail").unwrap(), || false).unwrap(),
         0
     );
     // An unscoped rule sees every file; match ids continue past `login`'s.
     assert_eq!(
-        results::evaluate_rule(&mut store, set.rule("get").unwrap()).unwrap(),
+        results::evaluate_rule(&mut store, set.rule("get").unwrap(), || false).unwrap(),
         1
     );
     assert_eq!(store.matched_event_count(&Default::default()).unwrap(), 2);
 
     // Re-evaluating replaces, never duplicates.
-    results::evaluate_rule(&mut store, set.rule("login").unwrap()).unwrap();
+    results::evaluate_rule(&mut store, set.rule("login").unwrap(), || false).unwrap();
     let page = results::query(&store, &Window::default()).unwrap();
     assert_eq!(
         page.groups
@@ -342,7 +342,7 @@ fn evaluating_a_json_path_rule_reads_its_column() {
         .unwrap();
 
     assert_eq!(
-        results::evaluate_rule(&mut store, set.rule("fail").unwrap()).unwrap(),
+        results::evaluate_rule(&mut store, set.rule("fail").unwrap(), || false).unwrap(),
         1
     );
 }
@@ -423,14 +423,14 @@ fn log_type_filter_narrows_events_groups_and_matches() {
     groups.sort();
     assert_eq!(groups, [("alb_get", 2), ("any_root", 2)]);
     let alb_matches = results::rule_matches(&store, "any_root", &window).unwrap();
-    assert_eq!(alb_matches.total, 2);
+    assert_eq!(alb_matches.total, Some(2));
     assert!(alb_matches
         .rows
         .iter()
         .all(|m| m.event_name.as_deref() == Some("GET")));
 
     let events = results::all_events(&store, &window).unwrap();
-    assert_eq!(events.total, 2);
+    assert_eq!(events.total, Some(2));
     assert!(events
         .rows
         .iter()
@@ -570,7 +570,7 @@ fn a_rules_page_is_served_from_the_match_table_alone() {
         alb.event_time = Some(datetime!(2026-09-13 00:00:00).assume_utc());
         store.append_events(&[trail, alb]).unwrap();
         store.begin_rule_run(set.rules()).unwrap();
-        results::evaluate_rule(&mut store, set.rule("everything").unwrap()).unwrap();
+        results::evaluate_rule(&mut store, set.rule("everything").unwrap(), || false).unwrap();
     }
     duckdb::Connection::open(&db)
         .unwrap()
@@ -583,7 +583,7 @@ fn a_rules_page_is_served_from_the_match_table_alone() {
         ..Default::default()
     };
     let page = results::rule_matches(&store, "everything", &ten).unwrap();
-    assert_eq!(page.total, 2);
+    assert_eq!(page.total, Some(2));
     assert_eq!(page.rows.len(), 2);
     let trail = &page.rows[0];
     assert_eq!(trail.log_type, "cloudtrail");
@@ -607,7 +607,7 @@ fn a_rules_page_is_served_from_the_match_table_alone() {
         results::rule_matches(&store, "everything", &alb_only)
             .unwrap()
             .total,
-        1
+        Some(1)
     );
     assert_eq!(
         results::query(&store, &alb_only).unwrap().groups[0].match_count,
@@ -622,7 +622,7 @@ fn a_rules_page_is_served_from_the_match_table_alone() {
         results::rule_matches(&store, "everything", &on_the_12th)
             .unwrap()
             .total,
-        1
+        Some(1)
     );
     let searched = Window {
         search: "getobject".into(),
@@ -632,7 +632,7 @@ fn a_rules_page_is_served_from_the_match_table_alone() {
         results::rule_matches(&store, "everything", &searched)
             .unwrap()
             .total,
-        1
+        Some(1)
     );
 }
 
@@ -679,7 +679,7 @@ fn an_older_case_gets_its_match_summaries_rebuilt_on_open() {
         ..Default::default()
     };
     let page = results::rule_matches(&store, "everything", &ten).unwrap();
-    assert_eq!(page.total, 2);
+    assert_eq!(page.total, Some(2));
     let trail = page.rows.iter().find(|r| r.event_id == 0).unwrap();
     assert_eq!(trail.log_type, "cloudtrail");
     assert_eq!(trail.event_name.as_deref(), Some("GetObject"));
@@ -852,24 +852,25 @@ fn a_rule_that_matched_nothing_is_still_listed() {
 fn all_events_can_be_paged_without_a_rule() {
     let (_tmp, store, _set) = seeded(5);
 
-    let page = |offset, limit| {
+    let page = |after, limit| {
         results::all_events(
             &store,
             &results::Window {
-                offset,
+                after,
                 limit,
                 ..Default::default()
             },
         )
         .unwrap()
     };
-    let first = page(0, 2);
-    let rest = page(2, 10);
+    let first = page(None, 2);
+    let rest = page(first.next_cursor.clone(), 10);
 
     // The "every event" view is how an analyst checks what the rules missed.
     assert_eq!(first.rows.len(), 2);
     assert_eq!(rest.rows.len(), 3);
-    assert_eq!(first.total, 5);
+    assert_eq!(first.total, Some(5));
+    assert_eq!(rest.total, None);
     assert_eq!(first.rows[0].event_name.as_deref(), Some("ConsoleLogin"));
     assert_eq!(first.rows[0].matched_fields, "{}");
 }
@@ -896,7 +897,6 @@ fn event_times_are_shown_in_kst_with_milliseconds() {
     let page = results::all_events(
         &store,
         &results::Window {
-            offset: 0,
             limit: 1,
             ..Default::default()
         },
@@ -954,6 +954,7 @@ fn a_rule_can_be_counted_without_saving_or_touching_stored_matches() {
                }"#,
         )
         .unwrap(),
+        || false,
     )
     .unwrap();
 
@@ -982,11 +983,197 @@ fn counting_a_rule_that_matches_nothing_returns_zero() {
                }"#,
         )
         .unwrap(),
+        || false,
     )
     .unwrap();
 
     assert_eq!(count.hits, 0);
     assert_eq!(count.scanned, 2);
+}
+
+/// Matches every event `pending_case` stores.
+const BULK_RULE: &str = r#"rule bulk {
+       meta: description = "d" severity = "low"
+       fields: $n = event_name == "ConsoleLogin"
+       condition: $n
+   }"#;
+
+/// A case holding `count` matching events with `source`'s rules registered
+/// but not yet evaluated.
+fn pending_case(count: u64, source: &str) -> (tempfile::TempDir, Store, RuleSet) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    let events: Vec<_> = (0..count).map(|i| event(i, "ConsoleLogin")).collect();
+    store.append_events(&events).unwrap();
+    let set = RuleSet::from_source(source).unwrap();
+    store
+        .writer_handle()
+        .unwrap()
+        .begin_rule_run(set.rules())
+        .unwrap();
+    (tmp, store, set)
+}
+
+#[test]
+fn cancelling_before_the_scan_starts_leaves_the_rule_pending() {
+    let (_tmp, mut store, set) = pending_case(5, BULK_RULE);
+
+    let err = results::evaluate_rule(&mut store, set.rule("bulk").unwrap(), || true).unwrap_err();
+
+    assert!(matches!(err, StoreError::Cancelled));
+    // A cancelled run is not a finished one: the rule must still be offered
+    // for evaluation, with no hits recorded.
+    let page = results::query(&store, &Window::default()).unwrap();
+    let bulk = page.groups.iter().find(|g| g.rule_id == "bulk").unwrap();
+    assert!(!bulk.evaluated);
+    assert_eq!(bulk.match_count, 0);
+    assert_eq!(store.match_count().unwrap(), 0);
+}
+
+#[test]
+fn cancelling_during_the_final_hit_flush_keeps_the_rule_pending() {
+    let (_tmp, mut store, set) = pending_case(5, BULK_RULE);
+    let probe = store.writer_handle().unwrap();
+
+    // A small run writes its first hits only when the scan's tail is flushed.
+    let result = results::evaluate_rule(&mut store, set.rule("bulk").unwrap(), || {
+        probe.match_count().unwrap() > 0
+    });
+
+    assert!(matches!(result, Err(StoreError::Cancelled)));
+    let groups = store.rule_groups(&Window::default()).unwrap();
+    assert!(!groups[0].evaluated);
+    assert_eq!(store.match_count().unwrap(), 0);
+}
+
+#[test]
+fn a_cancel_landing_after_an_empty_scan_still_cancels() {
+    // No files, so the scan visits no row: only a check once the pass is
+    // over can see a cancel that arrived while the run was in flight.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    let set = RuleSet::from_source(BULK_RULE).unwrap();
+    store
+        .writer_handle()
+        .unwrap()
+        .begin_rule_run(set.rules())
+        .unwrap();
+    let polls = AtomicU64::new(0);
+
+    let err = results::evaluate_rule(&mut store, set.rule("bulk").unwrap(), || {
+        // False for the check that starts the run, true from then on.
+        polls.fetch_add(1, Ordering::Relaxed) > 0
+    })
+    .unwrap_err();
+
+    assert!(matches!(err, StoreError::Cancelled));
+    let page = results::query(&store, &Window::default()).unwrap();
+    let bulk = page.groups.iter().find(|g| g.rule_id == "bulk").unwrap();
+    assert!(!bulk.evaluated);
+}
+
+#[test]
+fn cancelling_mid_scan_drops_the_partial_hits_and_a_retry_starts_fresh() {
+    // More events than the evaluator's 10,000-hit batch, so hits are on
+    // disk before the cancel lands.
+    const EVENTS: u64 = 12_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    let mut events: Vec<_> = (0..EVENTS).map(|i| event(i, "ConsoleLogin")).collect();
+    events.push(event(EVENTS, "AssumeRole"));
+    store.append_events(&events).unwrap();
+    let set = RuleSet::from_source(
+        r#"rule bulk { fields: $n = event_name == "ConsoleLogin" condition: $n }
+           rule other { fields: $n = event_name == "AssumeRole" condition: $n }"#,
+    )
+    .unwrap();
+    store
+        .writer_handle()
+        .unwrap()
+        .begin_rule_run(set.rules())
+        .unwrap();
+    // Another rule's stored hits must survive the cancelled run.
+    assert_eq!(
+        results::evaluate_rule(&mut store, set.rule("other").unwrap(), || false).unwrap(),
+        1
+    );
+
+    // A second handle reads what the run has written so far.
+    let probe = store.writer_handle().unwrap();
+    let polls = AtomicU64::new(0);
+    let persisted = AtomicU64::new(0);
+
+    let err = results::evaluate_rule(&mut store, set.rule("bulk").unwrap(), || {
+        // Polls run ahead of rows only by the pre-scan, file and chunk
+        // checks, so this lands past the first batch's flush.
+        if polls.fetch_add(1, Ordering::Relaxed) < 10_500 {
+            return false;
+        }
+        persisted.store(probe.match_count().unwrap(), Ordering::Relaxed);
+        true
+    })
+    .unwrap_err();
+
+    assert!(matches!(err, StoreError::Cancelled));
+    let persisted = persisted.load(Ordering::Relaxed);
+    assert!(
+        persisted > 10_000,
+        "cancel landed before a batch was written ({persisted} rows), so nothing partial was tested"
+    );
+    // The partial hits are gone and the unrelated rule keeps its hit.
+    assert_eq!(store.match_count().unwrap(), 1);
+    let page = results::query(&store, &Window::default()).unwrap();
+    let bulk = page.groups.iter().find(|g| g.rule_id == "bulk").unwrap();
+    assert!(!bulk.evaluated);
+    assert_eq!(bulk.match_count, 0);
+    let other = page.groups.iter().find(|g| g.rule_id == "other").unwrap();
+    assert!(other.evaluated);
+    assert_eq!(other.match_count, 1);
+
+    // Retrying evaluates the whole case again, without the discarded hits
+    // coming back doubled.
+    let hits = results::evaluate_rule(&mut store, set.rule("bulk").unwrap(), || false).unwrap();
+    assert_eq!(hits, EVENTS);
+    assert_eq!(store.match_count().unwrap(), EVENTS + 1);
+    let page = results::query(&store, &Window::default()).unwrap();
+    let bulk = page.groups.iter().find(|g| g.rule_id == "bulk").unwrap();
+    assert!(bulk.evaluated);
+    assert_eq!(bulk.match_count, EVENTS);
+}
+
+#[test]
+fn cancelling_a_draft_count_stops_the_pass_without_a_partial_answer() {
+    let (_tmp, store, _set) = seeded(50);
+    let trial = RuleSet::from_source(
+        r#"rule trial {
+               meta: description = "d" severity = "low"
+               fields: $n = event_name == "ConsoleLogin"
+               condition: $n
+           }"#,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        results::count_matches(&store, &trial, || true).unwrap_err(),
+        StoreError::Cancelled
+    ));
+
+    // Mid-scan the count is abandoned, not returned half-done.
+    let polls = AtomicU64::new(0);
+    let err = results::count_matches(&store, &trial, || {
+        polls.fetch_add(1, Ordering::Relaxed) >= 10
+    })
+    .unwrap_err();
+
+    assert!(matches!(err, StoreError::Cancelled));
+    // A draft count never writes, cancelled or not.
+    assert_eq!(store.match_count().unwrap(), 50);
 }
 
 /// Events whose time order is the reverse of their insertion order, so a sort
@@ -1063,7 +1250,6 @@ fn a_rules_matches_are_ordered_oldest_first_unless_asked_otherwise() {
         &store,
         "everything",
         &Window {
-            offset: 0,
             limit: 10,
             ..Default::default()
         },
@@ -1073,7 +1259,6 @@ fn a_rules_matches_are_ordered_oldest_first_unless_asked_otherwise() {
         &store,
         "everything",
         &Window {
-            offset: 0,
             limit: 10,
             newest_first: true,
             ..Default::default()
@@ -1182,7 +1367,7 @@ fn a_date_range_narrows_every_view_in_kst() {
 
     let matches = results::rule_matches(&store, "everything", &window).unwrap();
     assert_eq!(names(&matches), ["ConsoleLogin"]);
-    assert_eq!(matches.total, 1);
+    assert_eq!(matches.total, Some(1));
     let page = results::query(&store, &window).unwrap();
     assert_eq!(page.groups[0].match_count, 1);
     // The timeless event is excluded: it cannot be placed in the range.
@@ -1192,7 +1377,7 @@ fn a_date_range_narrows_every_view_in_kst() {
     assert_eq!(page.last_day.as_deref(), Some("2026-09-13"));
 
     let events = results::all_events(&store, &window).unwrap();
-    assert_eq!(events.total, 1);
+    assert_eq!(events.total, Some(1));
     assert_eq!(events.rows[0].event_name.as_deref(), Some("ConsoleLogin"));
 
     // Open-ended: only a lower bound.
@@ -1205,7 +1390,7 @@ fn a_date_range_narrows_every_view_in_kst() {
         },
     )
     .unwrap();
-    assert_eq!(from_12.total, 2);
+    assert_eq!(from_12.total, Some(2));
 
     // A KST day boundary: 2026-09-11 09:00 KST is inside the 11th, so a
     // range ending on the 10th excludes it and one ending on the 11th does not.
@@ -1218,7 +1403,7 @@ fn a_date_range_narrows_every_view_in_kst() {
         },
     )
     .unwrap();
-    assert_eq!(to_10.total, 0);
+    assert_eq!(to_10.total, Some(0));
 }
 
 #[test]
@@ -1272,7 +1457,7 @@ fn bounds_accept_a_time_of_day_and_are_inclusive_at_their_unit() {
                 ..Default::default()
             },
         )
-        .map(|p| p.total)
+        .map(|p| p.total.unwrap())
     };
     // ConsoleLogin is at 2026-09-12 09:00:00 KST exactly.
     assert_eq!(
@@ -1308,7 +1493,6 @@ fn search_narrows_a_rules_matches_and_the_total_follows_the_filter() {
     let (_tmp, store) = timed();
 
     let window = Window {
-        offset: 0,
         limit: 10,
         search: "console".into(),
         ..Default::default()
@@ -1318,7 +1502,7 @@ fn search_narrows_a_rules_matches_and_the_total_follows_the_filter() {
     // Case-insensitive, and the count under the table must describe the
     // filtered list — not the rule's full hit count.
     assert_eq!(names(&page), ["ConsoleLogin"]);
-    assert_eq!(page.total, 1);
+    assert_eq!(page.total, Some(1));
     // The rule group keeps its real hit count: the sidebar is not filtered.
     assert_eq!(
         results::query(&store, &window).unwrap().groups[0].match_count,
@@ -1334,7 +1518,6 @@ fn search_covers_every_column_the_table_shows() {
             &store,
             "everything",
             &Window {
-                offset: 0,
                 limit: 10,
                 search: needle.into(),
                 ..Default::default()
@@ -1342,6 +1525,7 @@ fn search_covers_every_column_the_table_shows() {
         )
         .unwrap()
         .total
+        .unwrap()
     };
 
     assert_eq!(hits("198.51.100.7"), 1, "source ip");
@@ -1366,7 +1550,6 @@ fn the_all_events_view_filters_and_sorts_the_same_way() {
     let page = results::all_events(
         &store,
         &results::Window {
-            offset: 0,
             limit: 10,
             search: "203.0.113".into(),
             newest_first: true,
@@ -1383,7 +1566,7 @@ fn the_all_events_view_filters_and_sorts_the_same_way() {
         ["ConsoleLogin", "CreateUser"]
     );
     // Paging needs the filtered total, or the list stops short or over-fetches.
-    assert_eq!(page.total, 2);
+    assert_eq!(page.total, Some(2));
 }
 
 #[test]
@@ -1393,7 +1576,6 @@ fn a_page_size_the_ui_could_get_wrong_is_clamped_not_obeyed() {
         results::all_events(
             &store,
             &results::Window {
-                offset: 0,
                 limit,
                 ..Default::default()
             },
@@ -1414,4 +1596,66 @@ fn a_page_size_the_ui_could_get_wrong_is_clamped_not_obeyed() {
         .page_limit(),
         1_000
     );
+}
+
+#[test]
+fn page_boundaries_preserve_timestamp_precision_ties_and_nulls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "paging", "/masked").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    store.register_file(1, "b.log.gz", 1, "alb_access").unwrap();
+    let base = datetime!(2026-09-12 00:00:00).assume_utc();
+    let mut rows = Vec::new();
+    for (id, micros) in [
+        (0, Some(2)),
+        (1, Some(1)),
+        (2, Some(1)),
+        (3, None),
+        (4, None),
+    ] {
+        let mut row = event(id, "Keep");
+        row.event_time = micros.map(|us| base + time::Duration::microseconds(us));
+        rows.push(row);
+    }
+    let mut other_type = event(0, "Keep");
+    other_type.file_id = 1;
+    other_type.event_time = Some(base);
+    rows.push(other_type);
+    rows.push(event(5, "Excluded"));
+    store.append_events(&rows).unwrap();
+    let rules =
+        RuleSet::from_source("rule everything { fields: $n = event_name exists condition: $n }")
+            .unwrap();
+    store.begin_rule_run(rules.rules()).unwrap();
+    results::evaluate_rule(&mut store, rules.rule("everything").unwrap(), || false).unwrap();
+
+    for rule in [None, Some("everything")] {
+        for (newest_first, expected) in [(false, vec![1, 2, 0, 3, 4]), (true, vec![0, 2, 1, 4, 3])]
+        {
+            let mut actual = Vec::new();
+            let mut after = None;
+            for page_number in 0..=5 {
+                let window = Window {
+                    after,
+                    limit: 1,
+                    newest_first,
+                    log_type: Some("cloudtrail".into()),
+                    search: "keep".into(),
+                    ..Default::default()
+                };
+                let page = match rule {
+                    Some(id) => results::rule_matches(&store, id, &window),
+                    None => results::all_events(&store, &window),
+                }
+                .unwrap();
+                assert_eq!(page.total, (page_number == 0).then_some(5));
+                after = page.next_cursor;
+                actual.extend(page.rows.iter().map(|row| row.event_id));
+            }
+            assert!(after.is_none(), "the page after the last row is empty");
+            assert_eq!(actual, expected);
+        }
+    }
 }

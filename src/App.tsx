@@ -36,7 +36,7 @@ function Shell() {
         <ErrorBoundary label={SCREEN_LABELS[screen]} resetKey={`${screen}:${caseId ?? ""}`}>
           {screen === "start" && <StartPanel />}
           {screen === "parsing" && <ParsingPanel />}
-          {screen === "results" && caseId && <Results caseId={caseId} />}
+          {screen === "results" && caseId && <Results key={caseId} caseId={caseId} />}
         </ErrorBoundary>
       </main>
 
@@ -50,6 +50,11 @@ function Shell() {
           <button onClick={cancelParse} disabled={progress?.cancelRequested}>
             {progress?.cancelRequested ? "취소 중" : "취소"}
           </button>
+        </div>
+      )}
+      {work === "cancelling-rule" && (
+        <div className="work-dock" role="status" aria-live="polite">
+          룰 평가 중단 중…
         </div>
       )}
     </div>

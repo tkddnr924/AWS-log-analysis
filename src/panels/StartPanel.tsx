@@ -61,6 +61,7 @@ export function StartPanel() {
           <button
             className="primary hero-cta"
             onClick={() => void chooseDirectory()}
+            disabled={work !== "idle"}
           >
             분석할 디렉터리 선택
           </button>
@@ -110,7 +111,7 @@ function Toolbar() {
       <button
         onClick={reset}
         disabled={work !== "idle"}
-        title={work === "idle" ? "홈으로" : "파싱이 끝난 뒤에 가능합니다"}
+        title={work === "idle" ? "홈으로" : "작업이 끝난 뒤에 가능합니다"}
       >
         홈
       </button>
@@ -349,6 +350,7 @@ function CaseList({
                 <button
                   className="case-open-btn"
                   onClick={() => onOpen(c.case_id)}
+                  disabled={work === "cancelling-rule"}
                 >
                   열기
                 </button>
@@ -357,7 +359,7 @@ function CaseList({
                   title={
                     work === "idle"
                       ? "케이스 삭제"
-                      : "파싱 중에는 삭제할 수 없습니다"
+                      : "작업 중에는 삭제할 수 없습니다"
                   }
                   disabled={work !== "idle"}
                   onClick={() => setPending(c.case_id)}
