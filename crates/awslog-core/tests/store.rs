@@ -84,6 +84,30 @@ fn a_cancelled_scan_stops_at_the_row_the_cancel_lands_on() {
     assert_eq!(seen.load(Ordering::Relaxed), 2);
 }
 
+#[test]
+fn a_file_with_a_gap_is_scanned_past_the_chunk_boundary() {
+    // Malformed records leave holes in `record_index`: the parser numbers
+    // every line and stores only the ones that normalize. A scan that reads
+    // 50,000-row ranges and stops as soon as a range comes back short would
+    // end the file at its first hole and silently drop the rest.
+    const LAST: u64 = 60_000;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "case-1", "/logs").unwrap();
+    store
+        .register_file(1, "a.json.gz", 1234, "cloudtrail")
+        .unwrap();
+    let batch: Vec<_> = (0..=LAST)
+        .filter(|index| *index != 10)
+        .map(|index| event(index, "ConsoleLogin"))
+        .collect();
+    store.append_events(&batch).unwrap();
+
+    let mut seen = 0u64;
+    store.for_each_typed_event(|_, _, _| seen += 1).unwrap();
+
+    assert_eq!(seen, LAST);
+}
+
 // getrusage is unix-only; the invariant is platform-independent so measuring
 // it on one platform is enough. The high-water mark is process-wide, so each
 // probe runs in a child process of its own: sibling tests would otherwise

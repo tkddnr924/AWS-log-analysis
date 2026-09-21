@@ -1176,6 +1176,249 @@ fn cancelling_a_draft_count_stops_the_pass_without_a_partial_answer() {
     assert_eq!(store.match_count().unwrap(), 50);
 }
 
+/// More than one 50,000-row scan chunk, so a file's tail is reached only by
+/// continuing past a chunk that returned almost nothing.
+const CHUNKED_ROWS: u64 = 60_000;
+
+/// A case of one cloudtrail file, its rules registered but not evaluated.
+fn unevaluated(events: &[NormalizedEvent], source: &str) -> (tempfile::TempDir, Store, RuleSet) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    store.append_events(events).unwrap();
+    let set = RuleSet::from_source(source).unwrap();
+    store
+        .writer_handle()
+        .unwrap()
+        .begin_rule_run(set.rules())
+        .unwrap();
+    (tmp, store, set)
+}
+
+#[test]
+fn a_rule_matching_sparse_late_events_records_every_hit() {
+    // Three hits in 60,000 events, two of them past the 50,000-row chunk
+    // boundary. A scan narrowed to candidate rows must keep reading to the
+    // end of the file: treating a nearly empty chunk as the last one drops
+    // both late hits.
+    let mut events: Vec<_> = (0..CHUNKED_ROWS)
+        .map(|i| event(i, "ConsoleLogin"))
+        .collect();
+    for hit in [7usize, 50_000, 59_999] {
+        events[hit] = event(hit as u64, "DeleteTrail");
+    }
+    let (_tmp, mut store, set) = unevaluated(
+        &events,
+        r#"rule rare {
+               fields: $n = event_name == "DeleteTrail"
+               condition: $n
+           }"#,
+    );
+
+    let hits = results::evaluate_rule(&mut store, set.rule("rare").unwrap(), || false).unwrap();
+
+    assert_eq!(hits, 3);
+    let page = results::rule_matches(
+        &store,
+        "rare",
+        &Window {
+            limit: 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(page.total, Some(3));
+    let mut ids: Vec<u64> = page.rows.iter().map(|r| r.event_id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![7, 50_000, 59_999]);
+    // The draft count reads the same rows and reports the whole file as its
+    // denominator, not the candidates it narrowed to.
+    let count = results::count_matches(&store, &set, || false).unwrap();
+    assert_eq!((count.hits, count.scanned), (3, CHUNKED_ROWS));
+}
+
+#[test]
+fn a_type_scoped_draft_still_counts_every_event_in_the_case() {
+    // The editor reads hits as a proportion of the case, so skipping files
+    // the rule cannot apply to must not shrink the denominator.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    store.register_file(1, "b.log.gz", 1, "alb").unwrap();
+    let mut events: Vec<_> = (0..3).map(|i| event(i, "ConsoleLogin")).collect();
+    events.extend((0..2).map(|i| {
+        let mut alb = event(i, "ConsoleLogin");
+        alb.file_id = 1;
+        alb
+    }));
+    store.append_events(&events).unwrap();
+    let set = RuleSet::from_source(
+        r#"rule scoped {
+               meta: log_type = "cloudtrail"
+               fields: $n = event_name == "ConsoleLogin"
+               condition: $n
+           }"#,
+    )
+    .unwrap();
+
+    let count = results::count_matches(&store, &set, || false).unwrap();
+
+    // The alb file cannot hit, but its events were still part of the case.
+    assert_eq!((count.hits, count.scanned), (3, 5));
+}
+
+#[test]
+fn conditions_no_prefilter_can_narrow_still_see_every_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    let mut events = vec![
+        event(0, "ConsoleLogin"),
+        event(1, "DeleteTrail"),
+        event(2, "CreateUser"),
+        event(3, "ConsoleLogin"),
+    ];
+    events[3].error_code = Some("AccessDenied".into());
+    store.append_events(&events).unwrap();
+    let hits = |source: &str| {
+        results::count_matches(&store, &RuleSet::from_source(source).unwrap(), || false)
+            .unwrap()
+            .hits
+    };
+
+    // Neither branch of an `or` is required, so neither may narrow the scan.
+    assert_eq!(
+        hits(
+            r#"rule a { fields: $x = event_name == "ConsoleLogin"
+                                 $y = event_name == "DeleteTrail"
+                         condition: $x or $y }"#
+        ),
+        3
+    );
+    // One variable, two conditions: either one satisfies it.
+    assert_eq!(
+        hits(
+            r#"rule b { fields: $x = event_name == "ConsoleLogin"
+                                 $x = event_name == "CreateUser"
+                         condition: $x }"#
+        ),
+        3
+    );
+    // `missing` is satisfied by exactly the rows an equality filter drops.
+    assert_eq!(
+        hits(r#"rule c { fields: $x = error_code missing condition: $x }"#),
+        3
+    );
+    // A negated variable says nothing about the rows that match.
+    assert_eq!(
+        hits(r#"rule d { fields: $x = error_code exists condition: not $x }"#),
+        3
+    );
+    // Case folding is the evaluator's business, never the database's.
+    assert_eq!(
+        hits(r#"rule e { fields: $x = event_name == "consolelogin" condition: $x }"#),
+        0
+    );
+    assert_eq!(
+        hits(r#"rule f { fields: $x = event_name icontains "consolelogin" condition: $x }"#),
+        2
+    );
+    // Sets and conjunctions may be pushed down; the hits must not move.
+    assert_eq!(
+        hits(
+            r#"rule g { fields: $x = event_name in ("ConsoleLogin", "CreateUser")
+                         condition: $x }"#
+        ),
+        3
+    );
+    assert_eq!(
+        hits(
+            r#"rule h { fields: $x = event_name == "ConsoleLogin"
+                                 $y = identity_type == "Root"
+                         condition: $x and $y }"#
+        ),
+        2
+    );
+    // `2 of` needs both, `1 of` neither.
+    assert_eq!(
+        hits(
+            r#"rule i { fields: $x = event_name == "ConsoleLogin"
+                                 $y = identity_type == "Root"
+                         condition: 2 of ($x, $y) }"#
+        ),
+        2
+    );
+    assert_eq!(
+        hits(
+            r#"rule j { fields: $x = event_name == "ConsoleLogin"
+                                 $y = event_name == "CreateUser"
+                         condition: 1 of ($x, $y) }"#
+        ),
+        3
+    );
+    // A count reads only the columns the set names; a rule on a JSON body
+    // must still be handed that body.
+    assert_eq!(
+        hits(r#"rule k { fields: $x = raw.eventName == "DeleteTrail" condition: $x }"#),
+        1
+    );
+}
+
+#[test]
+fn a_run_past_one_hit_batch_keeps_every_rows_summary() {
+    // Hits are persisted in 10,000-row batches, each re-reading its events'
+    // summaries from `events`. A rule that hits nearly everything is the
+    // case that reads the most, and the tail batch is the short one.
+    const EVENTS: u64 = 10_500;
+    let mut events: Vec<_> = (0..EVENTS).map(|i| event(i, "ConsoleLogin")).collect();
+    events[(EVENTS - 1) as usize].source_ip = Some("198.51.100.77".into());
+    let (_tmp, mut store, set) = unevaluated(&events, BULK_RULE);
+
+    let hits = results::evaluate_rule(&mut store, set.rule("bulk").unwrap(), || false).unwrap();
+
+    assert_eq!(hits, EVENTS);
+    let first = results::rule_matches(
+        &store,
+        "bulk",
+        &Window {
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(first.total, Some(EVENTS));
+    assert_eq!(first.rows[0].event_name.as_deref(), Some("ConsoleLogin"));
+    assert_eq!(first.rows[0].log_type, "cloudtrail");
+    assert_eq!(first.rows[0].source_ip.as_deref(), Some("203.0.113.10"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&first.rows[0].matched_fields).unwrap(),
+        serde_json::json!({ "$n": "ConsoleLogin" })
+    );
+    // The row written by the scan's tail flush carries its summary too.
+    let tail = results::rule_matches(
+        &store,
+        "bulk",
+        &Window {
+            limit: 10,
+            search: "198.51.100.77".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(tail.rows.len(), 1);
+    assert_eq!(tail.rows[0].event_id, EVENTS - 1);
+    assert_eq!(
+        tail.rows[0].identity_arn.as_deref(),
+        Some("arn:aws:iam::000000000000:root")
+    );
+}
+
 /// Events whose time order is the reverse of their insertion order, so a sort
 /// that silently falls back to `event_id` cannot pass these tests.
 fn timed() -> (tempfile::TempDir, Store) {

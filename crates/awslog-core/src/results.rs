@@ -204,8 +204,10 @@ pub struct MatchCount {
 ///
 /// The editor uses this to answer "how many would this catch?" while the rule
 /// is still being written: persisting a trial run would leave a half-finished
-/// rule in the case's results. `scanned` comes from the same pass so the
-/// answer can be read as a proportion without a second query.
+/// rule in the case's results. The pass reads only the columns the set names
+/// and only the files some rule applies to, and lets DuckDB drop rows no rule
+/// can match; `scanned` still counts every event the case holds, so the
+/// answer reads as a proportion of the case without a second query.
 ///
 /// `cancelled` abandons the pass; a half-counted draft is no answer, so it
 /// reports [`StoreError::Cancelled`] rather than a partial total.
@@ -214,30 +216,27 @@ pub fn count_matches(
     set: &crate::rule::RuleSet,
     cancelled: impl Fn() -> bool,
 ) -> Result<MatchCount, StoreError> {
-    let mut count = MatchCount {
-        hits: 0,
-        scanned: 0,
-    };
-    store.scan_events(
-        None,
-        |_| true,
+    let mut hits = 0;
+    let rules: Vec<&crate::rule::Rule> = set.rules().iter().collect();
+    let scanned = store.scan_rule_candidates(
+        &rules,
         |_, log_type, event| {
-            count.scanned += 1;
             // One view per event, reused across rules: building it per rule was
             // the hot path the streaming evaluator already avoids.
             if crate::rule::evaluate_any(set.for_log_type(log_type), &event) {
-                count.hits += 1;
+                hits += 1;
             }
         },
         cancelled,
     )?;
-    Ok(count)
+    Ok(MatchCount { hits, scanned })
 }
 
 /// Runs one rule over the case and stores its matches (docs/04 lazy
-/// evaluation). Reads only the columns the rule names and only the files
-/// whose log type it applies to, so a narrow rule over a large case costs a
-/// fraction of a full pass.
+/// evaluation). Reads only the columns the rule names, only the files whose
+/// log type it applies to and, where the rule's condition allows it safely,
+/// only the rows that can satisfy it, so a narrow rule over a large case
+/// costs a fraction of a full pass.
 ///
 /// `cancelled` stops the run mid-scan. A run that did not finish leaves the
 /// rule pending with no hits: hits already written are dropped once the
@@ -250,23 +249,21 @@ pub fn evaluate_rule(
 ) -> Result<u64, StoreError> {
     store.reset_rule(rule)?;
     let set = crate::rule::RuleSet::single(rule.clone());
-    let columns = rule.columns();
     // The writer handle lives only for the scan: cleanup below must not run
     // while anything can still append.
     let run = {
         let mut writer = store.writer_handle()?;
         let mut sink = |batch: &[(String, crate::rule::Hit)]| writer.append_match_batch(batch);
         let mut streamer = crate::rule::MatchStreamer::new(&set, 10_000);
-        let scan = store.scan_events(
-            Some(&columns),
-            |log_type| rule.applies_to(log_type),
+        let scan = store.scan_rule_candidates(
+            &[rule],
             |id, log_type, event| streamer.push_for_log_type(id, log_type, &event, &mut sink),
             &cancelled,
         );
         // Only a completed scan flushes its tail; an abandoned run drops the
         // hits it was still holding.
         match scan {
-            Ok(()) => streamer
+            Ok(_) => streamer
                 .finish(&mut sink)
                 .map_err(StoreError::RuleRun)
                 .and_then(|summary| {

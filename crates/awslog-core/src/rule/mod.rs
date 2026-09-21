@@ -42,13 +42,6 @@ pub enum Op {
     Missing,
 }
 
-impl Op {
-    /// True when the operator ignores ASCII case.
-    fn case_insensitive(self) -> bool {
-        matches!(self, Op::IContains | Op::IStartsWith | Op::IEndsWith)
-    }
-}
-
 /// Right-hand side of a field condition.
 #[derive(Debug, Clone)]
 pub enum Literal {
