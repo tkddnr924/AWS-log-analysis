@@ -236,23 +236,6 @@ fn every_parse_error_names_the_line_it_happened_on() {
 }
 
 #[test]
-fn shipped_cloudtrail_pack_parses_with_practical_security_rules() {
-    let rules = parse_rules(include_str!("../../../rules/cloudtrail.yar")).unwrap();
-    let ids: Vec<_> = rules.iter().map(|rule| rule.id.as_str()).collect();
-
-    assert_eq!(rules.len(), 11);
-    for expected in [
-        "cloudtrail_root_api_activity",
-        "cloudtrail_iam_policy_change",
-        "cloudtrail_access_key_created",
-        "cloudtrail_kms_key_disruption",
-        "cloudtrail_monitoring_disabled",
-    ] {
-        assert!(ids.contains(&expected), "missing shipped rule {expected}");
-    }
-}
-
-#[test]
 fn rule_sources_cut_each_rule_out_of_a_multi_rule_file() {
     // Braces inside strings and regexes must not end a rule early, and
     // comments between rules belong to neither.

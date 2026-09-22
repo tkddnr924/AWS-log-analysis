@@ -11,16 +11,17 @@ rule alb_server_error
 
     fields:
         $status = response.elb_status_code >= 500
+        $upper = response.elb_status_code < 600
 
     condition:
-        $status
+        $status and $upper
 }
 
 rule alb_forbidden_request
 {
     meta:
         name        = "접근 거부 (403)"
-        description = "ALB rejected a request with HTTP 403"
+        description = "ALB recorded HTTP 403; the load balancer or target may have produced the response"
         severity    = "low"
         log_type    = "alb_access"
 

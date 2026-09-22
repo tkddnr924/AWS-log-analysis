@@ -10,7 +10,8 @@ rule nginx_server_error
 
     fields:
         $status = response.status >= 500
+        $upper = response.status < 600
 
     condition:
-        $status
+        $status and $upper
 }

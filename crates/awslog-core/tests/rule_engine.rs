@@ -153,11 +153,28 @@ fn shipped_rules_parse_and_are_scoped_to_their_log_types() {
     let set = RuleSet::shipped();
 
     assert!(set.errors().is_empty(), "{:?}", set.errors());
-    assert_eq!(set.for_log_type("cloudtrail").count(), 11);
-    assert_eq!(set.for_log_type("alb_access").count(), 3);
-    assert_eq!(set.for_log_type("waf_acl").count(), 2);
-    assert_eq!(set.for_log_type("apigw_access").count(), 1);
-    assert_eq!(set.for_log_type("nginx_access").count(), 1);
+    // Every shipped rule stays gated to the log type it declares: a stray
+    // gate would run CloudTrail logic against web access logs.
+    for log_type in [
+        "cloudtrail",
+        "alb_access",
+        "waf_acl",
+        "apigw_access",
+        "nginx_access",
+    ] {
+        assert!(
+            set.for_log_type(log_type).count() > 0,
+            "no shipped rule runs for {log_type}"
+        );
+        for rule in set.for_log_type(log_type) {
+            assert_eq!(
+                rule.meta.get("log_type").map(String::as_str),
+                Some(log_type),
+                "{} leaked into {log_type}",
+                rule.id
+            );
+        }
+    }
 
     // Every shipped rule carries the metadata the results view displays.
     for rule in set.rules() {
@@ -174,6 +191,199 @@ fn shipped_rules_parse_and_are_scoped_to_their_log_types() {
             rule.meta.contains_key("log_type"),
             "{} lacks log_type",
             rule.id
+        );
+    }
+}
+
+/// Shipped CloudTrail rules that fire for one event.
+fn cloudtrail_hits(set: &RuleSet, event: &NormalizedEvent) -> Vec<String> {
+    set.for_log_type("cloudtrail")
+        .filter(|r| rule::evaluate(r, event).is_some())
+        .map(|r| r.id.clone())
+        .collect()
+}
+
+fn fired(hits: &[String], id: &str) -> bool {
+    hits.iter().any(|h| h == id)
+}
+
+/// A console sign-in whose recorded outcome is `outcome`; `None` writes the
+/// JSON null CloudTrail uses when it has nothing to report.
+fn console_login(identity: &str, outcome: Option<&str>) -> NormalizedEvent {
+    let mut e = event("ConsoleLogin", identity);
+    e.response = Some(match outcome {
+        Some(value) => format!(r#"{{"ConsoleLogin":"{value}"}}"#),
+        None => r#"{"ConsoleLogin":null}"#.to_owned(),
+    });
+    e
+}
+
+fn iam_policy_event(name: &str, policy_arn: Option<&str>) -> NormalizedEvent {
+    let mut e = event(name, "IAMUser");
+    e.event_source = Some("iam.amazonaws.com".into());
+    e.request = Some(match policy_arn {
+        Some(arn) => format!(r#"{{"userName":"dev","policyArn":"{arn}"}}"#),
+        None => r#"{"userName":"dev"}"#.to_owned(),
+    });
+    e
+}
+
+#[test]
+fn root_sign_in_attempts_and_confirmed_root_sign_ins_are_distinct_findings() {
+    let set = RuleSet::shipped();
+
+    let failed = cloudtrail_hits(&set, &console_login("Root", Some("Failure")));
+    assert!(fired(&failed, "cloudtrail_root_console_login"));
+    assert!(
+        !fired(&failed, "cloudtrail_root_console_login_success"),
+        "a rejected sign-in must not be reported as a root session"
+    );
+
+    let succeeded = cloudtrail_hits(&set, &console_login("Root", Some("Success")));
+    assert!(fired(&succeeded, "cloudtrail_root_console_login"));
+    assert!(fired(&succeeded, "cloudtrail_root_console_login_success"));
+
+    // Someone else's successful sign-in is not a root sign-in.
+    let iam_user = cloudtrail_hits(&set, &console_login("IAMUser", Some("Success")));
+    assert!(!fired(&iam_user, "cloudtrail_root_console_login"));
+    assert!(!fired(&iam_user, "cloudtrail_root_console_login_success"));
+}
+
+#[test]
+fn a_confirmed_sign_in_needs_a_recorded_success() {
+    let set = RuleSet::shipped();
+    let mut absent = console_login("Root", Some("Success"));
+    absent.response = None;
+
+    for event in [
+        absent,                                 // the outcome was never recorded
+        console_login("Root", None),            // recorded, but null
+        console_login("Root", Some("Failure")), // recorded as rejected
+    ] {
+        let hits = cloudtrail_hits(&set, &event);
+        // The attempt still stands; only the confirmation is withheld.
+        assert!(fired(&hits, "cloudtrail_root_console_login"));
+        assert!(fired(&hits, "cloudtrail_login_without_mfa"));
+        assert!(
+            !fired(&hits, "cloudtrail_root_console_login_success"),
+            "{:?} claimed a root session",
+            event.response
+        );
+        assert!(
+            !fired(&hits, "cloudtrail_login_without_mfa_success"),
+            "{:?} claimed an MFA-less session",
+            event.response
+        );
+    }
+}
+
+#[test]
+fn sign_in_rules_only_read_the_sign_in_service() {
+    let set = RuleSet::shipped();
+    // `ConsoleLogin` reached from another service is not a console sign-in.
+    let mut elsewhere = console_login("Root", Some("Success"));
+    elsewhere.event_source = Some("iam.amazonaws.com".into());
+
+    let hits = cloudtrail_hits(&set, &elsewhere);
+
+    for id in [
+        "cloudtrail_root_console_login",
+        "cloudtrail_root_console_login_success",
+        "cloudtrail_login_without_mfa",
+        "cloudtrail_login_without_mfa_success",
+    ] {
+        assert!(!fired(&hits, id), "{id} fired off the sign-in source");
+    }
+}
+
+#[test]
+fn an_unknown_mfa_state_is_not_a_sign_in_without_mfa() {
+    let set = RuleSet::shipped();
+    let known_false = console_login("IAMUser", Some("Success"));
+    let mut unknown = known_false.clone();
+    unknown.mfa_authenticated = None;
+    let mut with_mfa = known_false.clone();
+    with_mfa.mfa_authenticated = Some(true);
+
+    let false_hits = cloudtrail_hits(&set, &known_false);
+    assert!(fired(&false_hits, "cloudtrail_login_without_mfa"));
+    assert!(fired(&false_hits, "cloudtrail_login_without_mfa_success"));
+
+    for event in [unknown, with_mfa] {
+        let hits = cloudtrail_hits(&set, &event);
+        assert!(
+            !fired(&hits, "cloudtrail_login_without_mfa"),
+            "mfa {:?} reported as absent",
+            event.mfa_authenticated
+        );
+        assert!(
+            !fired(&hits, "cloudtrail_login_without_mfa_success"),
+            "mfa {:?} reported as absent",
+            event.mfa_authenticated
+        );
+    }
+}
+
+#[test]
+fn attaching_aws_administrator_access_reports_only_the_admin_rule() {
+    let set = RuleSet::shipped();
+
+    for partition in ["aws", "aws-us-gov", "aws-cn"] {
+        let arn = format!("arn:{partition}:iam::aws:policy/AdministratorAccess");
+        for name in ["AttachUserPolicy", "AttachRolePolicy", "AttachGroupPolicy"] {
+            let hits = cloudtrail_hits(&set, &iam_policy_event(name, Some(&arn)));
+            assert!(
+                fired(&hits, "cloudtrail_admin_policy_attach_attempt"),
+                "{name} {arn} was not called out as an admin grant"
+            );
+            assert!(
+                !fired(&hits, "cloudtrail_iam_policy_change"),
+                "{name} {arn} reported twice"
+            );
+        }
+    }
+
+    // A refused grant is still an attempt worth reporting.
+    let mut denied = iam_policy_event(
+        "AttachRolePolicy",
+        Some("arn:aws:iam::aws:policy/AdministratorAccess"),
+    );
+    denied.error_code = Some("AccessDenied".into());
+    assert!(fired(
+        &cloudtrail_hits(&set, &denied),
+        "cloudtrail_admin_policy_attach_attempt"
+    ));
+}
+
+#[test]
+fn every_other_policy_change_stays_with_the_generic_iam_rule() {
+    let set = RuleSet::shipped();
+
+    for (name, arn) in [
+        // A managed policy that is not AdministratorAccess.
+        (
+            "AttachRolePolicy",
+            Some("arn:aws:iam::aws:policy/ReadOnlyAccess"),
+        ),
+        // A customer-managed policy that merely borrows the name.
+        (
+            "AttachUserPolicy",
+            Some("arn:aws:iam::000000000000:policy/AdministratorAccess"),
+        ),
+        // An attachment whose policy the log never recorded.
+        ("AttachGroupPolicy", None),
+        // An inline policy: there is no arn to compare at all.
+        ("PutUserPolicy", None),
+        ("SetDefaultPolicyVersion", None),
+    ] {
+        let hits = cloudtrail_hits(&set, &iam_policy_event(name, arn));
+        assert!(
+            fired(&hits, "cloudtrail_iam_policy_change"),
+            "{name} {arn:?} went unreported"
+        );
+        assert!(
+            !fired(&hits, "cloudtrail_admin_policy_attach_attempt"),
+            "{name} {arn:?} was called an admin grant"
         );
     }
 }
