@@ -87,7 +87,7 @@ jobs:
           if (Test-Path $target) { throw "case root created despite failure" }
 
       # FR-7: the app must not write to %LOCALAPPDATA%. Launch it briefly and
-      # assert the WebView2 data went to cases/webview beside the executable.
+      # assert the WebView2 data went to aws-log-analysis-cases/webview beside the executable.
       - name: Verify portable output
         shell: pwsh
         env:
@@ -118,19 +118,20 @@ jobs:
           if ($leaked) { throw "LOCALAPPDATA polluted by this run: $($leaked -join ', ')" }
           if ($new) { Write-Host "unrelated new dirs (ignored): $($new -join ', ')" }
 
-          if (-not (Test-Path "target\release\cases\app.log")) {
-            throw "cases/app.log missing beside the executable"
+          $root = "target\release\aws-log-analysis-cases"
+          if (-not (Test-Path "$root\app.log")) {
+            throw "aws-log-analysis-cases/app.log missing beside the executable"
           }
-          Get-Content "target\release\cases\app.log"
+          Get-Content "$root\app.log"
 
           # Positive evidence that data_directory took effect: WebView2 must
-          # have written its profile inside cases/webview.
-          $wv = Get-ChildItem "target\release\cases\webview" -Recurse -File -ErrorAction SilentlyContinue
-          if (-not $wv) { throw "data_directory not applied: cases/webview is empty" }
+          # have written its profile inside aws-log-analysis-cases/webview.
+          $wv = Get-ChildItem "$root\webview" -Recurse -File -ErrorAction SilentlyContinue
+          if (-not $wv) { throw "data_directory not applied: aws-log-analysis-cases/webview is empty" }
           $wv | Select-Object -First 5 FullName
 
       # The exe is the whole app: the rule pack is compiled in (docs/04) and
-      # everything it writes goes under cases/ beside it (docs/07). It ships
+      # everything it writes goes under aws-log-analysis-cases/ beside it (docs/07). It ships
       # under the project name.
       - name: Name the shipped exe
         shell: pwsh
