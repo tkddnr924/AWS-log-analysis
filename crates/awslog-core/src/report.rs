@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use specta::Type;
 
-use crate::detect::{Confidence, Detection, SampleRecord};
+use crate::detect::{Confidence, Detection};
 use crate::scan::{ScanReport, SkipReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Type)]
@@ -44,18 +44,9 @@ pub struct ScanSummary {
     pub skipped: Vec<SkippedRow>,
 }
 
-#[derive(Debug, Clone, Serialize, Type)]
-pub struct SampleRow {
-    pub raw: Option<String>,
-    pub event_time: Option<String>,
-    pub event_source: Option<String>,
-    pub event_name: Option<String>,
-    pub aws_region: Option<String>,
-    pub user_identity_type: Option<String>,
-    pub user_identity_arn: Option<String>,
-    pub source_ip_address: Option<String>,
-}
-
+/// One detected file for the review grid. It carries no sample record: the
+/// format card fetches its own (`preview_head`), and a record per file made
+/// the response for a corpus of millions of files gigabytes long.
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct DetectionRow {
     pub display_path: String,
@@ -66,7 +57,6 @@ pub struct DetectionRow {
     pub estimated: bool,
     #[specta(type = u32)]
     pub members_in_head: usize,
-    pub sample: Option<SampleRow>,
     pub note: Option<String>,
 }
 
@@ -107,7 +97,6 @@ pub fn to_row(root: &Path, detection: &Detection) -> DetectionRow {
         record_count_estimate: detection.record_count_estimate,
         estimated: detection.estimated,
         members_in_head: detection.members_in_head,
-        sample: detection.sample.as_ref().map(sample_row),
         note: detection.note.clone(),
     }
 }
@@ -140,7 +129,6 @@ pub fn detect_all_with_progress(
                     record_count_estimate: None,
                     estimated: false,
                     members_in_head: 0,
-                    sample: None,
                     note: Some(err.to_string()),
                 },
             };
@@ -164,19 +152,6 @@ fn confidence_name(confidence: Confidence) -> &'static str {
         Confidence::High => "high",
         Confidence::Low => "low",
         Confidence::None => "none",
-    }
-}
-
-fn sample_row(sample: &SampleRecord) -> SampleRow {
-    SampleRow {
-        raw: sample.raw.clone(),
-        event_time: sample.event_time.clone(),
-        event_source: sample.event_source.clone(),
-        event_name: sample.event_name.clone(),
-        aws_region: sample.aws_region.clone(),
-        user_identity_type: sample.user_identity_type.clone(),
-        user_identity_arn: sample.user_identity_arn.clone(),
-        source_ip_address: sample.source_ip_address.clone(),
     }
 }
 

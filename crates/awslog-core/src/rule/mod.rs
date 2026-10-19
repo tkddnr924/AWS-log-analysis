@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 pub use eval::{evaluate, evaluate_any, evaluate_view, EventView, Match};
 pub use explain::explain;
-pub use parser::{parse_rules, rule_sources, ParseRuleError};
+pub use parser::{parse_condition, parse_rules, rule_sources, ParseRuleError};
 pub use set::{
     match_events, stream_matches, Hit, MatchReport, MatchStreamer, MatchSummary, RuleError,
     RuleMatchGroup, RuleSet, RuleSummary,
@@ -66,7 +66,9 @@ impl Literal {
     }
 }
 
-/// `$var = <field> <op> <value>`
+/// `$var = <field> <op> <value>`, or a condition written straight into
+/// `condition:`, which the parser binds to the field's name (`error_code`,
+/// `error_code#2` for a second one on the same field).
 #[derive(Debug, Clone)]
 pub struct FieldCondition {
     pub var: String,

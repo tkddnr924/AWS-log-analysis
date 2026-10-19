@@ -229,6 +229,57 @@ fn match_reports_which_fields_fired_and_their_values() {
 }
 
 #[test]
+fn conditions_can_be_written_without_declaring_variables() {
+    let e = event();
+    // No `fields:` section at all.
+    assert!(matches(
+        &rule(
+            r#"condition: event_source == "signin.amazonaws.com" and response.ConsoleLogin == "Failure""#
+        ),
+        &e
+    ));
+    assert!(!matches(
+        &rule(
+            r#"condition: event_source == "signin.amazonaws.com" and not user_agent contains "aws-cli""#
+        ),
+        &e
+    ));
+    // Two conditions on one field stay two: a shared name would let either
+    // one satisfy both.
+    assert!(!matches(
+        &rule(r#"condition: event_name == "ConsoleLogin" and event_name == "AssumeRole""#),
+        &e
+    ));
+    // Mixed with declared variables, and inside `N of`.
+    assert!(matches(
+        &rule(
+            r#"fields: $root = identity_type == "Root"
+               condition: $root and 2 of (aws_region == "us-east-1", event_name == "ConsoleLogin", mfa_authenticated == false)"#
+        ),
+        &e
+    ));
+}
+
+#[test]
+fn an_inline_condition_reports_its_evidence_under_the_field_name() {
+    let rules = parse_rules(&rule(
+        r#"condition: event_source == "signin.amazonaws.com" and event_source endswith ".com""#,
+    ))
+    .unwrap();
+
+    let hit = evaluate(&rules[0], &event()).expect("match");
+
+    assert_eq!(
+        hit.matched_fields.get("event_source").map(String::as_str),
+        Some("signin.amazonaws.com")
+    );
+    assert_eq!(
+        hit.matched_fields.get("event_source#2").map(String::as_str),
+        Some("signin.amazonaws.com")
+    );
+}
+
+#[test]
 fn raw_escape_hatch_exposes_the_original_record() {
     assert!(matches(
         &rule(r#"fields: $a = raw contains "ConsoleLogin" condition: $a"#),

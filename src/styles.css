@@ -1889,7 +1889,11 @@ button.primary:hover:not(:disabled) {
    controls and does not move as its digits change. */
 .match-pane .match-head {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  /* The search takes the rest; every control after it (status note, count,
+     sort, 통계) is its own auto column on the same row. */
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: auto;
   align-items: center;
   gap: 9px;
   margin: 0;
@@ -1921,6 +1925,17 @@ button.primary:hover:not(:disabled) {
 
 .match-search::placeholder {
   color: var(--muted);
+}
+
+/* How the search box is being read (condition search, progress, error). */
+.search-note {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  color: #9fc7ff;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Tabular digits: the count changes while paging and a proportional font
@@ -2284,6 +2299,230 @@ button.primary:hover:not(:disabled) {
   box-shadow: var(--glass-edge);
 }
 
+/* Per-field counts: the field list on the left, the counts beside it. */
+.stats-dialog {
+  width: min(980px, 82vw);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-left: 1px solid rgba(79, 156, 249, 0.22);
+  background: linear-gradient(145deg, #171b24 0%, #12161e 72%);
+  box-shadow: -24px 0 70px rgba(0, 0, 0, 0.42);
+  padding: 17px 20px;
+}
+
+.stats-dialog > header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.stats-dialog h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.stats-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: 0;
+}
+
+/* A plain index, not a stack of buttons: one quiet row per field, with the
+   chosen one marked by an accent rule on its left edge. */
+.stats-fields {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  padding: 2px 12px 12px 0;
+  border-right: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.stats-fields h3 {
+  margin: 14px 0 4px 10px;
+  color: #6f7d94;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.stats-fields h3:first-child {
+  margin-top: 0;
+}
+
+/* Sized like a field row, not the compact filter in the rule editor. */
+.stats-fields .payload-filter {
+  flex: none;
+  width: calc(100% - 10px);
+  height: 32px;
+  margin: 4px 0 8px 10px;
+  padding: 0 10px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+}
+
+.stats-fields .payload-filter::placeholder {
+  color: #6f7d94;
+}
+
+.stats-dialog .stats-field {
+  display: block;
+  width: 100%;
+  padding: 5px 10px;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0 5px 5px 0;
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  text-shadow: none;
+  color: #b8c3d4;
+  font-size: 13px;
+  line-height: 1.35;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.stats-dialog .stats-field:hover:not(.on) {
+  transform: none;
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: none;
+  color: #e6edf6;
+}
+
+.stats-dialog .stats-field.on {
+  transform: none;
+  border-left-color: var(--accent);
+  background: rgba(88, 166, 255, 0.1);
+  box-shadow: none;
+  color: #f1f6ff;
+}
+
+.stats-values {
+  min-width: 0;
+  overflow-y: auto;
+  padding: 0 4px 12px 20px;
+}
+
+.stats-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-bottom: 12px;
+}
+
+.stats-head h3 {
+  margin: 0;
+  color: #f1f6ff;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.stats-head span {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* One row per value. The fill behind the row is its count against the most
+   frequent value; the numbers sit at the right edge in fixed columns. */
+.stats-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.stats-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 52px;
+  align-items: baseline;
+  gap: 14px;
+  padding: 6px 10px;
+  border-radius: 5px;
+  background: linear-gradient(
+    90deg,
+    rgba(88, 166, 255, 0.16) var(--fill),
+    rgba(255, 255, 255, 0.02) var(--fill)
+  );
+  font-size: 13px;
+}
+
+/* Every row is one line high so the list scans evenly; a long value
+   (User-Agent, ARNs) is cut with an ellipsis and wraps in full only while
+   its row is open. */
+.stats-list .value {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  text-shadow: none;
+  color: #dce5ef;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: zoom-in;
+}
+
+.stats-list .value:hover {
+  transform: none;
+  background: none;
+  box-shadow: none;
+  color: #f1f6ff;
+}
+
+.stats-list li.open {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.stats-list li.open .value {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  cursor: zoom-out;
+}
+
+.stats-list .value.empty {
+  color: var(--muted);
+  font-family: var(--font-ui);
+}
+
+.stats-list .count {
+  color: #f1f6ff;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.stats-list .pct {
+  color: #8b9bb2;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.stats-dialog .muted {
+  color: var(--muted);
+}
+
+.stats-dialog .small {
+  font-size: 12px;
+}
+
 .raw header {
   display: flex;
   align-items: center;
@@ -2574,10 +2813,13 @@ button.primary:hover:not(:disabled) {
   box-shadow: inset 3px 0 0 rgba(248, 81, 73, 0.72);
 }
 
+/* Dot, then the name, with the rule id under the name. As a flex row a
+   long id squeezed the name (an anonymous item) to one character per line. */
 .outline h3 {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: baseline;
-  gap: 8px;
+  gap: 2px 8px;
   margin: 0 0 7px;
   color: #a9e9b7;
   font-size: 14px;
@@ -2585,6 +2827,7 @@ button.primary:hover:not(:disabled) {
 }
 
 .outline.broken h3 {
+  grid-template-columns: auto minmax(0, 1fr) auto;
   color: #ffaaa6;
 }
 
@@ -2607,9 +2850,11 @@ button.primary:hover:not(:disabled) {
 }
 
 .outline h3 code {
+  grid-column: 2;
   color: #7d8ba4;
   font-size: 12px;
   font-weight: 500;
+  overflow-wrap: anywhere;
 }
 
 .outline p {

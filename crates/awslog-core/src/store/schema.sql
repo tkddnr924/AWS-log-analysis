@@ -22,6 +22,9 @@ CREATE TABLE IF NOT EXISTS files (
     note         VARCHAR
 );
 
+-- The JSON bodies are most of a case. FSST (DuckDB's default for them)
+-- shrank a 2.3 KB CloudTrail `raw` only ~1.9x; ZSTD ~5.7x and appends faster
+-- (docs/05 "DuckDB 설정"). Needs the v1.2+ storage format (`Store::create`).
 CREATE TABLE IF NOT EXISTS events (
     event_id          UBIGINT PRIMARY KEY,
     file_id           UINTEGER NOT NULL,
@@ -41,10 +44,10 @@ CREATE TABLE IF NOT EXISTS events (
     error_message     VARCHAR,
     read_only         BOOLEAN,
     management_event  BOOLEAN,
-    request           JSON,
-    response          JSON,
-    resources         JSON,
-    raw               JSON
+    request           JSON USING COMPRESSION zstd,
+    response          JSON USING COMPRESSION zstd,
+    resources         JSON USING COMPRESSION zstd,
+    raw               JSON USING COMPRESSION zstd
 );
 
 -- Rules used for the stored matches, so results stay explainable when the

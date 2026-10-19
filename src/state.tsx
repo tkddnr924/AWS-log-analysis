@@ -11,6 +11,7 @@ import {
 import { Channel } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isParseableLogType } from "./lib/format";
+import { createRuleTasks } from "./lib/ruleTasks";
 import {
   commands,
   events,
@@ -18,6 +19,7 @@ import {
   type DetectionRow,
   type ParseResult,
   type MappingEntry,
+  type ConditionSearch,
   type RuleHits,
   type ScanSummary,
 } from "./bindings";
@@ -70,15 +72,18 @@ type State = {
   cancelParse: () => void;
   evaluateRule: (caseId: string, ruleId: string) => Promise<number>;
   countRuleMatches: (caseId: string, source: string) => Promise<RuleHits>;
+  /// Runs a condition typed into the results search; `null` when the text
+  /// is not a condition. Replaces a running or waiting search; rejects with
+  /// `SupersededError` when a newer one replaced this one first.
+  searchCondition: (
+    caseId: string,
+    ruleId: string | null,
+    query: string,
+  ) => Promise<ConditionSearch | null>;
+  /// Drops the search, running or waiting; evaluations are left alone.
+  cancelSearch: () => Promise<void>;
   cancelRule: () => Promise<void>;
   reset: () => void;
-};
-
-type RuleTask = {
-  started: Promise<void>;
-  finished: Promise<void>;
-  done: boolean;
-  stopping?: Promise<void>;
 };
 
 const Ctx = createContext<State | null>(null);
@@ -110,74 +115,59 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const workRef = useRef<Work>("idle");
   workRef.current = work;
 
-  const ruleTask = useRef<RuleTask | null>(null);
+  const ruleTasks = useMemo(
+    () =>
+      createRuleTasks({
+        idle: () => workRef.current === "idle",
+        setWork: (next) => {
+          workRef.current = next;
+          setWork(next);
+        },
+        cancelBackend: () => commands.cancelParse(),
+        notice: setNotice,
+      }),
+    [],
+  );
+  const cancelRule = ruleTasks.cancel;
+  const cancelSearch = ruleTasks.cancelSearch;
 
-  const runRule = useCallback(<T,>(start: (started: Channel<null>) => Promise<T>) => {
-    if (workRef.current !== "idle" || ruleTask.current) {
-      return Promise.reject(new Error("다른 작업이 진행 중입니다"));
-    }
+  /// The `started` channel a rule command fires once it holds the slot.
+  const startedChannel = (started: () => void) => {
     const channel = new Channel<null>();
-    const started = new Promise<void>((resolve) => {
-      channel.onmessage = () => resolve();
-    });
-    workRef.current = "evaluating";
-    setWork("evaluating");
-    const response = start(channel);
-    const task: RuleTask = { started, finished: Promise.resolve(), done: false };
-    const finish = () => {
-      task.done = true;
-      if (ruleTask.current !== task) return;
-      ruleTask.current = null;
-      if (!task.stopping) {
-        workRef.current = "idle";
-        setWork("idle");
-      }
-    };
-    task.finished = response.then(finish, finish);
-    ruleTask.current = task;
-    return response;
-  }, []);
-
-  const cancelRule = useCallback((): Promise<void> => {
-    const task = ruleTask.current;
-    if (!task) return Promise.resolve();
-    if (task.stopping) return task.stopping;
-    workRef.current = "cancelling-rule";
-    setWork("cancelling-rule");
-    task.stopping = (async () => {
-      try {
-        // Cancellation must not arrive before the backend claims its slot.
-        await Promise.race([task.started, task.finished]);
-        if (!task.done) await commands.cancelParse();
-      } catch (error) {
-        setNotice(String(error));
-      } finally {
-        // The acknowledgement only sets a flag; the worker still owns the DB.
-        await task.finished;
-        workRef.current = "idle";
-        setWork("idle");
-      }
-    })();
-    return task.stopping;
-  }, []);
-
+    channel.onmessage = started;
+    return channel;
+  };
   const evaluateRule = useCallback(
     (id: string, ruleId: string) =>
-      runRule(async (started) => {
-        const result = await commands.evaluateRule(id, ruleId, started);
+      ruleTasks.run(async (started) => {
+        const result = await commands.evaluateRule(id, ruleId, startedChannel(started));
         if (result.status === "error") throw new Error(result.error);
         return result.data;
       }),
-    [runRule],
+    [ruleTasks],
   );
   const countRuleMatches = useCallback(
     (id: string, source: string) =>
-      runRule(async (started) => {
-        const result = await commands.countRuleMatches(id, source, started);
+      ruleTasks.run(async (started) => {
+        const result = await commands.countRuleMatches(id, source, startedChannel(started));
         if (result.status === "error") throw new Error(result.error);
         return result.data;
       }),
-    [runRule],
+    [ruleTasks],
+  );
+  const searchCondition = useCallback(
+    (id: string, ruleId: string | null, query: string) =>
+      ruleTasks.run(async (started) => {
+        const result = await commands.searchCondition(
+          id,
+          ruleId,
+          query,
+          startedChannel(started),
+        );
+        if (result.status === "error") throw new Error(result.error);
+        return result.data;
+      }, true),
+    [ruleTasks],
   );
   // Subscribed for the whole app lifetime, not per screen: progress must keep
   // arriving while the user browses another screen.
@@ -362,6 +352,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       startParse,
       evaluateRule,
       countRuleMatches,
+      searchCondition,
+      cancelSearch,
       cancelRule,
       cancelParse: () => {
         void commands.cancelParse();
@@ -400,6 +392,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       refreshCases,
       evaluateRule,
       countRuleMatches,
+      searchCondition,
+      cancelSearch,
       cancelRule,
     ],
   );

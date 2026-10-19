@@ -57,6 +57,9 @@ impl ParseSlot {
 /// Refusal when the slot is taken. The parse and every rule scan share it.
 const SLOT_BUSY: &str = "파싱 또는 룰 평가가 진행 중입니다";
 
+/// Least time between two parse progress events (`start_parse`).
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// An event id crossing IPC. Ids are `(file_id << 32) | record_index`, so
 /// anything past the first file exceeds u32. specta refuses u64, and the
 /// value is exact in a JS number below 2^53 (file ids stay far under 2^21).
@@ -243,7 +246,7 @@ struct DetectProgress {
     total: u32,
 }
 
-/// FR-3/FR-4: classify each candidate and return one sample record per file.
+/// FR-3/FR-4: classify each candidate for the review grid.
 /// Files are decoded in parallel; progress is emitted so the UI can show
 /// movement instead of waiting for one large response.
 #[tauri::command]
@@ -274,7 +277,10 @@ async fn detect_logs(app: tauri::AppHandle, path: String) -> Result<Vec<Detectio
 struct ParseProgress {
     files_done: u32,
     files_total: u32,
-    records_parsed: u32,
+    // A 300–500 GB corpus can pass u32::MAX records. Typed as u32 only for
+    // TypeScript (`number`); JSON carries the full value.
+    #[specta(type = u32)]
+    records_parsed: u64,
     /// True once cancellation was requested, so the UI can lock the button
     /// instead of firing the command repeatedly.
     cancel_requested: bool,
@@ -287,7 +293,8 @@ struct ParseResult {
     files_parsed: u32,
     files_skipped: u32,
     files_failed: u32,
-    records_parsed: u32,
+    #[specta(type = u32)]
+    records_parsed: u64,
     cancelled: bool,
 }
 
@@ -437,11 +444,25 @@ async fn start_parse(
             mapping,
             ..Default::default()
         };
+        // Every worker reports each stored batch and each finished file; a
+        // corpus of millions of files would flood IPC and re-render the
+        // panel per event. The UI merges with `max`, so skipping is safe;
+        // the last file always goes through.
+        let last_emit: Mutex<Option<std::time::Instant>> = Mutex::new(None);
         let emit = |p: awslog_core::parse::Progress| {
+            {
+                let mut last = last_emit.lock();
+                let now = std::time::Instant::now();
+                let finished = p.files_done == p.files_total;
+                if !finished && last.is_some_and(|at| now - at < PROGRESS_INTERVAL) {
+                    return;
+                }
+                *last = Some(now);
+            }
             let _ = ParseProgress {
                 files_done: p.files_done as u32,
                 files_total: p.files_total as u32,
-                records_parsed: p.records_parsed as u32,
+                records_parsed: p.records_parsed,
                 cancel_requested: cancel.load(std::sync::atomic::Ordering::Relaxed),
             }
             .emit(&app);
@@ -492,7 +513,7 @@ async fn start_parse(
             files_parsed: outcome.files_parsed as u32,
             files_skipped: outcome.files_skipped as u32,
             files_failed: outcome.files_failed as u32,
-            records_parsed: outcome.records_parsed as u32,
+            records_parsed: outcome.records_parsed,
             cancelled: outcome.cancelled,
         })
     })
@@ -600,6 +621,56 @@ fn evaluate_rule_in(
     results::evaluate_rule(&mut store, rule, cancelled).map_err(|e| e.to_string())
 }
 
+/// Where a condition search put its hits: page them with
+/// `query_rule_matches(case_id, rule_id, …)`.
+#[derive(Clone, Debug, serde::Serialize, specta::Type)]
+struct ConditionSearch {
+    rule_id: String,
+    hits: u32,
+}
+
+/// The results search box, when what it holds is a rule condition
+/// (`error_code matches /AccessDenied/`): evaluates it over the case — or
+/// over `rule_id`'s matches — and stores the hits for paging. Text that is
+/// not a condition returns `None` without touching the case; the caller
+/// then runs the plain text search. Claims the slot like `evaluate_rule`.
+#[tauri::command]
+#[specta::specta]
+async fn search_condition(
+    state: tauri::State<'_, AppState>,
+    case_id: String,
+    rule_id: Option<String>,
+    query: String,
+    started: tauri::ipc::Channel<()>,
+) -> Result<Option<ConditionSearch>, String> {
+    let Ok(parsed) = awslog_core::rule::parse_condition(&query) else {
+        return Ok(None);
+    };
+    let state = state.inner().clone();
+    let run = begin_rule_scan(&state.parse, || started.send(()).map_err(|e| e.to_string()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let within = match &rule_id {
+            Some(rule_id) => Some(
+                RuleSet::load_layered(&state.cases_root.user_rules_dir())
+                    .map_err(|e| e.to_string())?
+                    .rule(rule_id)
+                    .cloned()
+                    .ok_or_else(|| format!("룰을 찾을 수 없습니다: {rule_id}"))?,
+            ),
+            None => None,
+        };
+        let mut store = state.store(&case_id)?;
+        let hits = results::search_condition(&mut store, within.as_ref(), &parsed, run.cancelled())
+            .map_err(|e| e.to_string())?;
+        Ok(Some(ConditionSearch {
+            rule_id: results::SEARCH_RULE_ID.to_owned(),
+            hits: hits as u32,
+        }))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Lists rule groups and totals for a case. The window's log type and date
 /// range narrow everything, group counts included; its search is ignored.
 /// Rows are paged by `query_rule_matches` and `query_events`, so scrolling
@@ -669,6 +740,27 @@ async fn query_rule_matches(
     tauri::async_runtime::spawn_blocking(move || {
         let store = state.store(&case_id)?;
         results::rule_matches(&store, &rule_id, &window).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Per-value counts of one field over the list on screen: every event
+/// (`rule_id` null) or one rule's / a condition search's matches, under the
+/// window's log type, date range and text search.
+#[tauri::command]
+#[specta::specta]
+async fn field_stats(
+    state: tauri::State<'_, AppState>,
+    case_id: String,
+    rule_id: Option<String>,
+    field: String,
+    window: results::Window,
+) -> Result<results::FieldStats, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = state.store(&case_id)?;
+        results::field_stats(&store, rule_id.as_deref(), &field, &window).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -775,36 +867,64 @@ async fn list_rule_sources(state: tauri::State<'_, AppState>) -> Result<Vec<Rule
 
 /// Validates and stores one user rule, refreshes the case snapshot and
 /// registers the rule as pending in the case: selecting it evaluates it.
+///
+/// `replaces` is the id of the rule the editor opened. Renaming it in the
+/// source replaces that rule rather than adding a second one beside it.
 #[tauri::command]
 #[specta::specta]
 async fn save_rule(
     state: tauri::State<'_, AppState>,
     case_id: String,
     source: String,
+    replaces: Option<String>,
 ) -> Result<String, String> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || save_rule_in(&state, &case_id, &source))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        save_rule_in(&state, &case_id, &source, replaces.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
-fn save_rule_in(state: &AppState, case_id: &str, source: &str) -> Result<String, String> {
+fn save_rule_in(
+    state: &AppState,
+    case_id: &str,
+    source: &str,
+    replaces: Option<&str>,
+) -> Result<String, String> {
     let _run = state.parse.begin().ok_or_else(|| SLOT_BUSY.to_owned())?;
     let user_dir = state.cases_root.user_rules_dir();
+    // Renaming onto an id another rule already has would silently
+    // overwrite or shadow that rule.
+    let renamed_to = RuleSet::from_source(source)
+        .ok()
+        .and_then(|set| set.rules().first().map(|rule| rule.id.clone()))
+        .filter(|id| replaces.is_some_and(|old| old != id));
+    if let Some(id) = &renamed_to {
+        let set = RuleSet::load_layered(&user_dir).map_err(|e| e.to_string())?;
+        if set.rule(id).is_some() {
+            return Err(format!("같은 식별자의 룰이 이미 있습니다: {id}"));
+        }
+    }
     let rule_id = write_user_rule(&user_dir, source)?;
-    let set = RuleSet::load_layered(&user_dir).map_err(|e| e.to_string())?;
-    let rule = set
-        .rule(&rule_id)
-        .ok_or_else(|| format!("저장한 룰을 다시 읽지 못했습니다: {rule_id}"))?;
     let case_dir = state
         .cases_root
         .case_dir(case_id)
         .ok_or_else(|| format!("잘못된 케이스 id: {case_id}"))?;
+    let mut store = state.store(case_id)?;
+    if let Some(old) = replaces.filter(|old| *old != rule_id) {
+        let path = user_rule_path(&user_dir, old)?;
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        store.remove_rule(old).map_err(|e| e.to_string())?;
+    }
+    let set = RuleSet::load_layered(&user_dir).map_err(|e| e.to_string())?;
+    let rule = set
+        .rule(&rule_id)
+        .ok_or_else(|| format!("저장한 룰을 다시 읽지 못했습니다: {rule_id}"))?;
     RuleSet::snapshot_into(&user_dir, &case_dir.join("rules")).map_err(|e| e.to_string())?;
-    state
-        .store(case_id)?
-        .reset_rule(rule)
-        .map_err(|e| e.to_string())?;
+    store.reset_rule(rule).map_err(|e| e.to_string())?;
     Ok(rule_id)
 }
 
@@ -1139,7 +1259,9 @@ pub fn run() {
             query_events,
             get_event,
             explain_rule,
-            count_rule_matches
+            count_rule_matches,
+            search_condition,
+            field_stats
         ])
         .events(collect_events![DetectProgress, ParseProgress]);
 
@@ -1411,7 +1533,7 @@ mod tests {
     fn saving_a_rule_registers_it_pending_and_selecting_evaluates_it() {
         let (_tmp, state, case_id) = seeded_case();
 
-        let rule_id = save_rule_in(&state, &case_id, HIT).unwrap();
+        let rule_id = save_rule_in(&state, &case_id, HIT, None).unwrap();
 
         assert_eq!(rule_id, "my_hit");
         // One rule per file under cases/rules, named after its id, so delete
@@ -1443,6 +1565,46 @@ mod tests {
             .unwrap();
         assert!(groups[0].evaluated);
         assert_eq!(groups[0].match_count, 1);
+    }
+
+    #[test]
+    fn renaming_a_rule_while_editing_replaces_it_instead_of_adding_one() {
+        let (_tmp, state, case_id) = seeded_case();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
+        let renamed = HIT.replace("rule my_hit", "rule my_login");
+
+        let rule_id = save_rule_in(&state, &case_id, &renamed, Some("my_hit")).unwrap();
+
+        assert_eq!(rule_id, "my_login");
+        let user_dir = state.cases_root.user_rules_dir();
+        assert!(!user_dir.join("my_hit.yar").exists());
+        assert!(user_dir.join("my_login.yar").is_file());
+        let ids: Vec<String> = state
+            .store(&case_id)
+            .unwrap()
+            .rule_groups(&Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|group| group.rule_id)
+            .collect();
+        assert_eq!(ids, ["my_login"]);
+    }
+
+    #[test]
+    fn renaming_onto_another_rules_id_is_refused() {
+        let (_tmp, state, case_id) = seeded_case();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
+        let other = HIT.replace("rule my_hit", "rule other");
+        save_rule_in(&state, &case_id, &other, None).unwrap();
+
+        let err = save_rule_in(&state, &case_id, HIT, Some("other")).unwrap_err();
+
+        assert!(err.contains("my_hit"), "{err}");
+        assert!(state
+            .cases_root
+            .user_rules_dir()
+            .join("other.yar")
+            .is_file());
     }
 
     #[test]
@@ -1486,7 +1648,7 @@ mod tests {
     #[test]
     fn deleting_a_rule_removes_it_from_the_case_and_the_snapshot() {
         let (_tmp, state, case_id) = seeded_case();
-        save_rule_in(&state, &case_id, HIT).unwrap();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
         scan_rule(&state, &case_id, "my_hit").unwrap();
 
         delete_rule_in(&state, &case_id, "my_hit").unwrap();
@@ -1515,6 +1677,7 @@ mod tests {
                 fields: $n = event_name == "DeleteTrail"
                 condition: $n
             }"#,
+            None,
         )
         .unwrap();
 
@@ -1543,7 +1706,7 @@ mod tests {
         let (_tmp, state, case_id) = seeded_case();
         let earlier = state.store(&case_id).unwrap();
 
-        save_rule_in(&state, &case_id, HIT).unwrap();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
 
         let groups = earlier.rule_groups(&Default::default()).unwrap();
         assert_eq!(groups.len(), 1);
@@ -1560,7 +1723,7 @@ mod tests {
         let held = state.store(&case_a).unwrap();
 
         state.store(&case_b).unwrap();
-        save_rule_in(&state, &case_a, HIT).unwrap();
+        save_rule_in(&state, &case_a, HIT, None).unwrap();
 
         let groups = held.rule_groups(&Default::default()).unwrap();
         assert_eq!(groups.len(), 1);
@@ -1573,7 +1736,7 @@ mod tests {
     #[test]
     fn deleting_a_case_a_command_still_holds_is_refused_and_leaves_it_intact() {
         let (_tmp, state, case_id) = seeded_case();
-        save_rule_in(&state, &case_id, HIT).unwrap();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
         let case_dir = state.cases_root.case_dir(&case_id).unwrap();
         let held = state.store(&case_id).unwrap();
 
@@ -1616,7 +1779,7 @@ mod tests {
     #[test]
     fn rule_work_is_refused_while_a_parse_holds_the_slot() {
         let (_tmp, state, case_id) = seeded_case();
-        save_rule_in(&state, &case_id, HIT).unwrap();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
         let _parse = state.parse.begin().unwrap();
 
         // All three write or scan the same database, so they must not overlap.
@@ -1625,7 +1788,7 @@ mod tests {
             SLOT_BUSY
         );
         assert_eq!(count_draft(&state, &case_id, HIT).unwrap_err(), SLOT_BUSY);
-        assert!(save_rule_in(&state, &case_id, HIT).is_err());
+        assert!(save_rule_in(&state, &case_id, HIT, None).is_err());
     }
 
     /// Leaving the results view mid-evaluation: the rule must not be recorded
@@ -1633,7 +1796,7 @@ mod tests {
     #[test]
     fn a_cancelled_rule_scan_stays_unevaluated_and_a_retry_starts_fresh() {
         let (_tmp, state, case_id) = seeded_case();
-        save_rule_in(&state, &case_id, HIT).unwrap();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
 
         let cancelled = {
             let run = begin_rule_scan(&state.parse, || Ok(())).unwrap();
@@ -1665,7 +1828,7 @@ mod tests {
     #[test]
     fn a_cancelled_scan_frees_the_slot_when_its_worker_exits() {
         let (_tmp, state, case_id) = seeded_case();
-        save_rule_in(&state, &case_id, HIT).unwrap();
+        save_rule_in(&state, &case_id, HIT, None).unwrap();
         let (entered, worker_entered) = std::sync::mpsc::channel();
         let (resume, worker_resume) = std::sync::mpsc::channel();
 

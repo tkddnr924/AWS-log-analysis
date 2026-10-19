@@ -43,7 +43,7 @@ fn candidate_exposes_a_path_relative_to_the_scanned_root() {
 }
 
 #[test]
-fn detection_row_carries_type_confidence_and_sample_fields() {
+fn detection_row_carries_type_and_confidence() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("a.json.gz");
     let json = cloudtrail_json(&[cloudtrail_record("ConsoleLogin")]);
@@ -54,8 +54,6 @@ fn detection_row_carries_type_confidence_and_sample_fields() {
     assert_eq!(row.log_type, "cloudtrail");
     assert_eq!(row.confidence, "high");
     assert_eq!(row.display_path, "a.json.gz");
-    let sample = row.sample.expect("sample record");
-    assert_eq!(sample.event_name.as_deref(), Some("ConsoleLogin"));
     assert!(row.note.is_none());
 }
 
@@ -68,7 +66,6 @@ fn undetected_file_row_keeps_the_reason_for_the_user() {
     let row = report::to_row(tmp.path(), &detect::detect_file(&path).unwrap());
 
     assert_eq!(row.log_type, "unknown");
-    assert!(row.sample.is_none());
     assert!(row.note.unwrap().contains("gzip"));
 }
 

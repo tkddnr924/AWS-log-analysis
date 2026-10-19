@@ -248,38 +248,10 @@ pub fn evaluate_rule(
     cancelled: impl Fn() -> bool,
 ) -> Result<u64, StoreError> {
     store.reset_rule(rule)?;
-    let set = crate::rule::RuleSet::single(rule.clone());
-    // The writer handle lives only for the scan: cleanup below must not run
-    // while anything can still append.
-    let run = {
-        let mut writer = store.writer_handle()?;
-        let mut sink = |batch: &[(String, crate::rule::Hit)]| writer.append_match_batch(batch);
-        let mut streamer = crate::rule::MatchStreamer::new(&set, 10_000);
-        let scan = store.scan_rule_candidates(
-            &[rule],
-            |id, log_type, event| streamer.push_for_log_type(id, log_type, &event, &mut sink),
-            &cancelled,
-        );
-        // Only a completed scan flushes its tail; an abandoned run drops the
-        // hits it was still holding.
-        match scan {
-            Ok(_) => streamer
-                .finish(&mut sink)
-                .map_err(StoreError::RuleRun)
-                .and_then(|summary| {
-                    if cancelled() {
-                        Err(StoreError::Cancelled)
-                    } else {
-                        Ok(summary)
-                    }
-                }),
-            Err(e) => Err(e),
-        }
-    };
-    match run {
-        Ok(summary) => {
+    match record_matches(store, rule, &cancelled) {
+        Ok(hits) => {
             store.mark_rule_evaluated(&rule.id)?;
-            Ok(summary.rules.iter().map(|r| r.match_count).sum())
+            Ok(hits)
         }
         Err(e) => {
             // Partial hits would read as a finished rule in the sidebar.
@@ -287,6 +259,140 @@ pub fn evaluate_rule(
             Err(e)
         }
     }
+}
+
+/// Scans for `rule` and appends its hits; returns their number. Leaves
+/// registering the rule, and clearing up after a failure, to the caller.
+fn record_matches(
+    store: &mut Store,
+    rule: &crate::rule::Rule,
+    cancelled: &impl Fn() -> bool,
+) -> Result<u64, StoreError> {
+    let set = crate::rule::RuleSet::single(rule.clone());
+    // The writer handle lives only for the scan: the caller's cleanup must
+    // not run while anything can still append.
+    let mut writer = store.writer_handle()?;
+    let mut sink = |batch: &[(String, crate::rule::Hit)]| writer.append_match_batch(batch);
+    let mut streamer = crate::rule::MatchStreamer::new(&set, 10_000);
+    store.scan_rule_candidates(
+        &[rule],
+        |id, log_type, event| streamer.push_for_log_type(id, log_type, &event, &mut sink),
+        cancelled,
+    )?;
+    // Only a completed scan flushes its tail; an abandoned run drops the
+    // hits it was still holding.
+    let summary = streamer.finish(&mut sink).map_err(StoreError::RuleRun)?;
+    if cancelled() {
+        return Err(StoreError::Cancelled);
+    }
+    Ok(summary.rules.iter().map(|r| r.match_count).sum())
+}
+
+/// How often each value of one field occurs in the list being looked at
+/// (`Store::field_stats`). `values` is the 200 most frequent or fewer;
+/// `total` and `distinct` count all rows and all values.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct FieldStats {
+    pub field: String,
+    #[specta(type = u32)]
+    pub total: u64,
+    #[specta(type = u32)]
+    pub distinct: u64,
+    pub values: Vec<FieldCount>,
+}
+
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct FieldCount {
+    /// `None`: the field is absent or null on those rows.
+    pub value: Option<String>,
+    #[specta(type = u32)]
+    pub count: u64,
+}
+
+/// Per-value counts of `field` over the list the window shows: every event,
+/// or the matches of `rule_id` (a rule, or [`SEARCH_RULE_ID`]).
+pub fn field_stats(
+    store: &Store,
+    rule_id: Option<&str>,
+    field: &str,
+    window: &Window,
+) -> Result<FieldStats, StoreError> {
+    store.field_stats(rule_id, field, window)
+}
+
+/// The rule id condition-search hits are stored under. `#` cannot start a
+/// rule identifier, so no rule shares it, and it is never registered in
+/// `rules`: the sidebar does not list it and case totals leave it out.
+pub const SEARCH_RULE_ID: &str = "#search";
+
+/// Runs a condition typed into the results search (`rule::parse_condition`)
+/// and stores its hits under [`SEARCH_RULE_ID`], replacing the previous
+/// search, so they page, count and filter exactly like a rule's matches.
+///
+/// `within` narrows to one rule's matches: the stored condition is that
+/// rule's `and` the query, scoped to the rule's log type. The query's
+/// variables are renamed `search:<name>` so they cannot merge with the
+/// rule's — one name means "either condition holds".
+pub fn search_condition(
+    store: &mut Store,
+    within: Option<&crate::rule::Rule>,
+    query: &crate::rule::Rule,
+    cancelled: impl Fn() -> bool,
+) -> Result<u64, StoreError> {
+    use crate::rule::{Condition, Rule};
+
+    let rule = match within {
+        None => Rule {
+            id: SEARCH_RULE_ID.to_owned(),
+            meta: Default::default(),
+            fields: query.fields.clone(),
+            condition: query.condition.clone(),
+        },
+        Some(scope) => {
+            fn renamed(condition: &Condition) -> Condition {
+                let var = |name: &String| format!("search:{name}");
+                match condition {
+                    Condition::Var(name) => Condition::Var(var(name)),
+                    Condition::Not(inner) => Condition::Not(Box::new(renamed(inner))),
+                    Condition::And(a, b) => {
+                        Condition::And(Box::new(renamed(a)), Box::new(renamed(b)))
+                    }
+                    Condition::Or(a, b) => {
+                        Condition::Or(Box::new(renamed(a)), Box::new(renamed(b)))
+                    }
+                    Condition::NOf(count, vars) => {
+                        Condition::NOf(*count, vars.iter().map(var).collect())
+                    }
+                }
+            }
+            let mut fields = scope.fields.clone();
+            fields.extend(query.fields.iter().map(|field| {
+                let mut field = field.clone();
+                field.var = format!("search:{}", field.var);
+                field
+            }));
+            Rule {
+                id: SEARCH_RULE_ID.to_owned(),
+                meta: scope
+                    .meta
+                    .get("log_type")
+                    .map(|t| ("log_type".to_owned(), t.clone()))
+                    .into_iter()
+                    .collect(),
+                fields,
+                condition: Condition::And(
+                    Box::new(scope.condition.clone()),
+                    Box::new(renamed(&query.condition)),
+                ),
+            }
+        }
+    };
+    // Never registered: the previous search's hits go, and so do a failed
+    // run's partial ones.
+    store.remove_rule(SEARCH_RULE_ID)?;
+    record_matches(store, &rule, &cancelled).inspect_err(|_| {
+        let _ = store.remove_rule(SEARCH_RULE_ID);
+    })
 }
 
 /// One event's stored columns for the detail view.

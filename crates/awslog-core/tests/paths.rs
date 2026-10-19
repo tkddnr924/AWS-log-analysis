@@ -40,7 +40,7 @@ fn falls_back_to_cases_beside_executable() {
 
     let root = paths::resolve(&sources(None, None, &exe));
 
-    assert_eq!(root, PathBuf::from("/opt/tool/cases"));
+    assert_eq!(root, PathBuf::from("/opt/tool/aws-log-analysis-cases"));
 }
 
 #[test]

@@ -11,7 +11,9 @@ import {
 } from "./bindings";
 import { RawRecord, RecordFields } from "./panels/RecordView";
 import { RuleEditor } from "./panels/RuleEditor";
+import { StatsDialog } from "./panels/StatsDialog";
 import { logTypeLabel } from "./lib/format";
+import { listSource, statsSource, type SearchMode } from "./lib/listSource";
 import { useApp } from "./state";
 
 const PAGE = 200;
@@ -44,7 +46,7 @@ function isBadBound(typed: string): boolean {
 
 /** FR-6 results window: rule groups on the left, their matches on the right. */
 export function Results({ caseId }: { caseId: string }) {
-  const { reset, go, work, evaluateRule } = useApp();
+  const { reset, go, work, evaluateRule, searchCondition, cancelSearch } = useApp();
   const mounted = useRef(false);
   useEffect(() => {
     mounted.current = true;
@@ -91,6 +93,8 @@ export function Results({ caseId }: { caseId: string }) {
   // Every effective rule's text, shipped or user, so any of them can be
   // opened in the editor. Saving writes a user override either way.
   const [sources, setSources] = useState<Record<string, RuleSource>>({});
+  // The per-field counts popup over the list on screen.
+  const [statsOpen, setStatsOpen] = useState(false);
   const [editing, setEditing] = useState<{ ruleId: string | null } | null>(
     null,
   );
@@ -187,6 +191,82 @@ export function Results({ caseId }: { caseId: string }) {
     return () => clearTimeout(timer);
   }, [typed]);
 
+  // A selected rule not yet evaluated is about to be (effect below), and
+  // that run and a search cannot share the database: the search waits.
+  const pendingRule =
+    selected !== ALL_EVENTS &&
+    page?.groups.find((g) => g.rule_id === selected)?.evaluated === false;
+  // What the settled search turned out to be. A rule condition
+  // (`error_code matches /…/`) is run like a rule, over the case or the
+  // selected rule's matches, and its hits are paged from `condition.ruleId`;
+  // anything else is the plain text search. Null while that is being
+  // decided, so no list is fetched for the wrong kind.
+  const [searchMode, setSearchMode] = useState<SearchMode>({
+    query: "",
+    condition: null,
+  });
+  useEffect(() => {
+    // Whatever this effect started, the next run or the unmount drops: a
+    // cleared box must not leave a scan holding the case.
+    if (search === "") {
+      setSearchMode({ query: "", condition: null });
+      void cancelSearch();
+      return;
+    }
+    setSearchMode(null);
+    // A rule being (or about to be) evaluated owns the database; the
+    // search runs once it is done.
+    if (reevaluating || pendingRule) return;
+    let stale = false;
+    searchCondition(caseId, selected === ALL_EVENTS ? null : selected, search)
+      .then((found) => {
+        if (stale) return;
+        setSearchMode({
+          query: search,
+          condition: found && { ruleId: found.rule_id, hits: found.hits },
+        });
+      })
+      .catch((error: unknown) => {
+        if (stale) return;
+        setSearchMode({ query: search, condition: null, error: String(error) });
+      });
+    return () => {
+      stale = true;
+      void cancelSearch();
+    };
+  }, [
+    caseId,
+    selected,
+    search,
+    version,
+    reevaluating,
+    pendingRule,
+    searchCondition,
+    cancelSearch,
+  ]);
+  const selectedRule = selected === ALL_EVENTS ? null : selected;
+  // The list on screen; null until the search box's text is classified.
+  const list = listSource(search, searchMode, selectedRule);
+  const searchReady = list !== null;
+  // What 통계 may count: the same list, once it is final.
+  const statsList = statsSource(
+    search,
+    searchMode,
+    selectedRule,
+    reevaluating || !!pendingRule,
+  );
+  // One page of the list on screen. Only called once `list` is known.
+  const fetchPage = (after: EventCursor | null) => {
+    const source = list ?? { ruleId: selectedRule, search };
+    return source.ruleId === null
+      ? commands.queryEvents(caseId, pageWindow(after, source.search, newestFirst))
+      : commands.queryRuleMatches(
+          caseId,
+          source.ruleId,
+          pageWindow(after, source.search, newestFirst),
+        );
+  };
+
   // Which rules exist and what they say; a save or delete changes both.
   useEffect(() => {
     commands.listRuleSources().then((r) => {
@@ -223,16 +303,8 @@ export function Results({ caseId }: { caseId: string }) {
     setNextCursor(null);
     setRowsLoading(true);
     const run = ++generation.current;
-    if (!rowsReady) return;
-    const request =
-      selected === ALL_EVENTS
-        ? commands.queryEvents(caseId, pageWindow(null, search, newestFirst))
-        : commands.queryRuleMatches(
-            caseId,
-            selected,
-            pageWindow(null, search, newestFirst),
-          );
-    request.then((r) => {
+    if (!rowsReady || !searchReady) return;
+    fetchPage(null).then((r) => {
       if (run !== generation.current) return;
       setRowsLoading(false);
       if (r.status === "error") return fail(r.error);
@@ -246,6 +318,7 @@ export function Results({ caseId }: { caseId: string }) {
     selected,
     version,
     search,
+    searchMode,
     newestFirst,
     logType,
     rowsReady,
@@ -271,17 +344,7 @@ export function Results({ caseId }: { caseId: string }) {
     const run = generation.current;
     loading.current = true;
     try {
-      const rows =
-        selected === ALL_EVENTS
-          ? await commands.queryEvents(
-              caseId,
-              pageWindow(after, search, newestFirst),
-            )
-          : await commands.queryRuleMatches(
-              caseId,
-              selected,
-              pageWindow(after, search, newestFirst),
-            );
+      const rows = await fetchPage(after);
       // A page that arrived after the user switched rules, searched or
       // reversed the order belongs to the previous list; appending it would
       // interleave two different queries.
@@ -304,6 +367,7 @@ export function Results({ caseId }: { caseId: string }) {
     reevaluating,
     rowsLoading,
     search,
+    searchMode,
     newestFirst,
     logType,
     from,
@@ -528,13 +592,26 @@ export function Results({ caseId }: { caseId: string }) {
           rowHeight={ROW_HEIGHT}
           search={typed}
           onSearch={setTyped}
-          searchLabel={
+          searchLabel={`${
             selected === ALL_EVENTS
               ? "전체 이벤트에서 검색"
               : `${page.groups.find((g) => g.rule_id === selected)?.name ?? selected} 결과에서 검색`
+          } — 글자 또는 조건 (예: error_code matches /Denied/)`}
+          searchNote={
+            search === ""
+              ? null
+              : !searchReady || !searchMode
+                ? "검색 중…"
+                : searchMode.error
+                  ? searchMode.error
+                  : searchMode.condition
+                    ? "조건 검색"
+                    : null
           }
           newestFirst={newestFirst}
           onToggleSort={() => setNewestFirst((v) => !v)}
+          onStats={() => setStatsOpen(true)}
+          statsReady={statsList !== null}
           // A new list under the same scrollbar: the old offset would land on
           // an unrelated row, or past the end of a shorter filtered list.
           viewKey={`${selected}\u0000${search}\u0000${newestFirst}\u0000${logType}\u0000${from}\u0000${to}`}
@@ -555,7 +632,8 @@ export function Results({ caseId }: { caseId: string }) {
           }
           onClose={() => setEditing(null)}
           onSave={async (source) => {
-            const r = await commands.saveRule(caseId, source);
+            // The id it was opened as: a rename replaces that rule.
+            const r = await commands.saveRule(caseId, source, editing.ruleId);
             if (r.status === "error") return r.error;
             // Selecting the saved rule evaluates it (see the effect above).
             setSelected(r.data);
@@ -573,6 +651,32 @@ export function Results({ caseId }: { caseId: string }) {
                 }
               : undefined
           }
+        />
+      )}
+
+      {statsOpen && (
+        <StatsDialog
+          caseId={caseId}
+          logType={logType}
+          // The list on screen as `fetchPage` asks for it — null while the
+          // search or a rule it needs is still resolving, so nothing is
+          // counted over a scope the list does not show.
+          scope={
+            statsList && {
+              ruleId: statsList.ruleId,
+              window: pageWindow(null, statsList.search, newestFirst),
+            }
+          }
+          scopeLabel={[
+            logType ?? "",
+            selected === ALL_EVENTS
+              ? "전체 이벤트"
+              : (page.groups.find((g) => g.rule_id === selected)?.name ?? selected),
+            search ? `검색: ${search}` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+          onClose={() => setStatsOpen(false)}
         />
       )}
 
@@ -803,8 +907,11 @@ function MatchList({
   search,
   onSearch,
   searchLabel,
+  searchNote,
   newestFirst,
   onToggleSort,
+  onStats,
+  statsReady,
   viewKey,
   evaluating,
   loading,
@@ -823,8 +930,15 @@ function MatchList({
   onSearch: (text: string) => void;
   /// Names what is being searched — the selected rule's matches, not the case.
   searchLabel: string;
+  /// How the search is read: "조건 검색" for a rule condition, a failure,
+  /// or progress; null for plain text.
+  searchNote: string | null;
   newestFirst: boolean;
   onToggleSort: () => void;
+  /// Opens the per-field counts of this list.
+  onStats: () => void;
+  /// The list's filter has resolved; until then there is nothing to count.
+  statsReady: boolean;
   /// Changes whenever the rows underneath are a different list.
   viewKey: string;
   /// The selected rule is being run over the case; the rows are on the way.
@@ -876,6 +990,11 @@ function MatchList({
           autoComplete="off"
           onChange={(e) => onSearch(e.target.value)}
         />
+        {searchNote && (
+          <span className="search-note" role="status" aria-live="polite">
+            {searchNote}
+          </span>
+        )}
         <span className="match-count">
           <strong>{matches.length.toLocaleString()}</strong> /{" "}
           {total.toLocaleString()} 건 표시
@@ -889,6 +1008,14 @@ function MatchList({
           title="시각 정렬 바꾸기"
         >
           {newestFirst ? "최신순 ↓" : "오래된순 ↑"}
+        </button>
+        <button
+          className="sort-toggle"
+          onClick={onStats}
+          disabled={!statsReady}
+          title={statsReady ? "필드별 건수" : "검색이 끝난 뒤에 볼 수 있습니다"}
+        >
+          통계
         </button>
       </div>
       <div className={`match-cols cols-${layout}`} role="presentation">

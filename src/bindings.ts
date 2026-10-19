@@ -13,7 +13,7 @@ export const commands = {
 	 */
 	scanDirectory: (path: string) => typedError<ScanSummary, string>(__TAURI_INVOKE("scan_directory", { path })),
 	/**
-	 *  FR-3/FR-4: classify each candidate and return one sample record per file.
+	 *  FR-3/FR-4: classify each candidate for the review grid.
 	 *  Files are decoded in parallel; progress is emitted so the UI can show
 	 *  movement instead of waiting for one large response.
 	 */
@@ -80,8 +80,11 @@ export const commands = {
 	/**
 	 *  Validates and stores one user rule, refreshes the case snapshot and
 	 *  registers the rule as pending in the case: selecting it evaluates it.
+	 * 
+	 *  `replaces` is the id of the rule the editor opened. Renaming it in the
+	 *  source replaces that rule rather than adding a second one beside it.
 	 */
-	saveRule: (caseId: string, source: string) => typedError<string, string>(__TAURI_INVOKE("save_rule", { caseId, source })),
+	saveRule: (caseId: string, source: string, replaces: string | null) => typedError<string, string>(__TAURI_INVOKE("save_rule", { caseId, source, replaces })),
 	/**
 	 *  Removes a rule from this case. A user rule's file goes too (the shipped
 	 *  rule it overrode, if any, is back for the next case); a shipped rule
@@ -107,6 +110,23 @@ export const commands = {
 	 *  the slot is held.
 	 */
 	countRuleMatches: (caseId: string, source: string, started: Channel<null>) => typedError<RuleHits, string>(__TAURI_INVOKE("count_rule_matches", { caseId, source, started })),
+	/**
+	 *  The results search box, when what it holds is a rule condition
+	 *  (`error_code matches /AccessDenied/`): evaluates it over the case — or
+	 *  over `rule_id`'s matches — and stores the hits for paging. Text that is
+	 *  not a condition returns `None` without touching the case; the caller
+	 *  then runs the plain text search. Claims the slot like `evaluate_rule`.
+	 */
+	searchCondition: (caseId: string, ruleId: string | null, query: string, started: Channel<null>) => typedError<{
+	rule_id: string,
+	hits: number,
+} | null, string>(__TAURI_INVOKE("search_condition", { caseId, ruleId, query, started })),
+	/**
+	 *  Per-value counts of one field over the list on screen: every event
+	 *  (`rule_id` null) or one rule's / a condition search's matches, under the
+	 *  window's log type, date range and text search.
+	 */
+	fieldStats: (caseId: string, ruleId: string | null, field: string, window: Window) => typedError<FieldStats, string>(__TAURI_INVOKE("field_stats", { caseId, ruleId, field, window })),
 };
 
 /** Events */
@@ -129,12 +149,26 @@ export type CaseSummary = {
 	event_count: number,
 };
 
+/**
+ *  Where a condition search put its hits: page them with
+ *  `query_rule_matches(case_id, rule_id, …)`.
+ */
+export type ConditionSearch = {
+	rule_id: string,
+	hits: number,
+};
+
 /**  Progress while classifying candidates. */
 export type DetectProgress = {
 	done: number,
 	total: number,
 };
 
+/**
+ *  One detected file for the review grid. It carries no sample record: the
+ *  format card fetches its own (`preview_head`), and a record per file made
+ *  the response for a corpus of millions of files gigabytes long.
+ */
 export type DetectionRow = {
 	display_path: string,
 	log_type: string,
@@ -142,7 +176,6 @@ export type DetectionRow = {
 	record_count_estimate: number | null,
 	estimated: boolean,
 	members_in_head: number,
-	sample: SampleRow | null,
 	note: string | null,
 };
 
@@ -164,11 +197,29 @@ export type EventPage = {
 	next_cursor: EventCursor | null,
 };
 
+export type FieldCount = {
+	/**  `None`: the field is absent or null on those rows. */
+	value: string | null,
+	count: number,
+};
+
 /**  One resolved field: `None` means no source path matched. */
 export type FieldPreview = {
 	field: string,
 	label: string,
 	value: string | null,
+};
+
+/**
+ *  How often each value of one field occurs in the list being looked at
+ *  (`Store::field_stats`). `values` is the 200 most frequent or fewer;
+ *  `total` and `distinct` count all rows and all values.
+ */
+export type FieldStats = {
+	field: string,
+	total: number,
+	distinct: number,
+	values: FieldCount[],
 };
 
 export type HeadPreview = {
@@ -378,17 +429,6 @@ export type RuleSource = {
 	source: string,
 	/**  Came from `cases/rules/`: deleting it removes the file too. */
 	user: boolean,
-};
-
-export type SampleRow = {
-	raw: string | null,
-	event_time: string | null,
-	event_source: string | null,
-	event_name: string | null,
-	aws_region: string | null,
-	user_identity_type: string | null,
-	user_identity_arn: string | null,
-	source_ip_address: string | null,
 };
 
 export type ScanSummary = {

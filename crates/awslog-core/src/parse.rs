@@ -87,24 +87,33 @@ pub struct Outcome {
     pub failures: Vec<FileFailure>,
 }
 
+/// Parser threads. Each owns an appender holding up to
+/// `store::APPENDER_FLUSH_BYTES`, so this also bounds parse memory. Past
+/// four, per-file commits used to contend for DuckDB's locks; with one
+/// appender per worker, eight cut a 1.09M-record CloudTrail corpus from
+/// 16.9s (four) to 11.9s on an 8-core M1 (docs/02 "동시성").
+const MAX_WORKERS: usize = 8;
+
 struct ParseJob {
     file_id: u32,
     display: String,
     path: PathBuf,
+    size_bytes: u64,
     log_type: LogType,
     detection_error: Option<String>,
 }
 
+/// What became of `jobs[job]`; `None` means cancelled before it started.
 struct JobResult {
-    file_id: u32,
-    display: String,
+    job: usize,
     parsed: Option<Result<ParsedFile, String>>,
 }
 
 /// Parses every candidate under `root` into `store`.
 ///
 /// Files decode concurrently through cloned handles to the same DuckDB
-/// database. Each worker keeps one bounded event batch and one file appender.
+/// database. Workers take the next file as they free up, and each keeps one
+/// bounded event batch and one appender for its whole share of the input.
 pub fn run(
     root: &Path,
     store: &mut Store,
@@ -126,14 +135,13 @@ pub fn run(
         })
         .collect();
     let total = chosen.len();
-    // Four decoders keep gzip/JSON work parallel without multiplying each
-    // worker's bounded batch or overwhelming DuckDB's single database file.
-    // The pool is not shrunk to the file count: a lone file still fans its
-    // line normalization out to the idle threads (`parse_line_file`).
+    // One decoder per core, up to MAX_WORKERS. The pool is not shrunk to the
+    // file count: a lone file still fans its line normalization out to the
+    // idle threads (`parse_line_file`).
     let worker_count = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(2)
-        .clamp(2, 4);
+        .clamp(2, MAX_WORKERS);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(worker_count)
         .thread_name(|index| format!("awslog-parser-{index}"))
@@ -142,48 +150,43 @@ pub fn run(
 
     // Head reads and gzip setup are independent. Preserve indexed order so
     // file IDs and later reports remain deterministic.
-    let detected: Vec<_> = pool.install(|| {
+    let jobs: Vec<ParseJob> = pool.install(|| {
         chosen
             .into_par_iter()
             .map(|(file_id, display, candidate)| {
-                let detection = detect::detect_file(&candidate.path);
-                (
+                let (log_type, detection_error) = match detect::detect_file(&candidate.path) {
+                    Ok(detection) => (detection.log_type, None),
+                    Err(error) => (
+                        LogType::Unknown,
+                        Some(crate::logging::redact(&error.to_string())),
+                    ),
+                };
+                ParseJob {
                     file_id,
                     display,
-                    candidate.path.clone(),
-                    candidate.size_bytes,
-                    detection,
-                )
+                    path: candidate.path.clone(),
+                    size_bytes: candidate.size_bytes,
+                    log_type,
+                    detection_error,
+                }
             })
             .collect()
     });
     // Register before opening appenders. Metadata writes must not interleave
     // with DuckDB's parallel bulk append transactions.
-    let mut buckets: Vec<Vec<ParseJob>> = (0..worker_count).map(|_| Vec::new()).collect();
-    for (index, (file_id, display, path, size_bytes, detection)) in detected.into_iter().enumerate()
-    {
-        let (log_type, detection_error) = match detection {
-            Ok(detection) => (detection.log_type, None),
-            Err(error) => (
-                LogType::Unknown,
-                Some(crate::logging::redact(&error.to_string())),
-            ),
-        };
-        store.register_file(file_id, &display, size_bytes, log_type.as_str())?;
-        buckets[index % worker_count].push(ParseJob {
-            file_id,
-            display,
-            path,
-            log_type,
-            detection_error,
-        });
-    }
-    let workers = buckets
-        .into_iter()
-        .filter(|jobs| !jobs.is_empty())
-        .map(|jobs| store.writer_handle().map(|writer| (writer, jobs)))
+    store.register_files(jobs.iter().map(|job| {
+        (
+            job.file_id,
+            job.display.as_str(),
+            job.size_bytes,
+            job.log_type.as_str(),
+        )
+    }))?;
+    let handles = (0..worker_count.min(jobs.len()))
+        .map(|_| store.writer_handle())
         .collect::<Result<Vec<_>, StoreError>>()?;
 
+    let next_job = AtomicUsize::new(0);
     let files_done = AtomicUsize::new(0);
     let records_parsed = AtomicU64::new(0);
     // Workers currently inside a file. While every pool thread has a file of
@@ -192,106 +195,111 @@ pub fn run(
     let spare_threads = || busy.load(Ordering::Relaxed) < worker_count;
     // Payload paths are counted where the batches are appended: one counter
     // per worker and log type, folded together after the run.
-    let completed: Vec<(Vec<JobResult>, HashMap<&'static str, KeyCounter>)> = pool.install(|| {
-        workers
+    type WorkerResult = (Vec<JobResult>, HashMap<&'static str, KeyCounter>);
+    let completed: Vec<WorkerResult> = pool.install(|| {
+        handles
             .into_par_iter()
-            .map(|(mut writer, jobs)| {
+            .map(|mut handle| -> Result<WorkerResult, StoreError> {
+                // One appender per worker, not per file: DuckDB commits on
+                // every appender flush, and a commit per small file (a
+                // CloudTrail object holds ~700 records) went through the WAL
+                // with an fsync and queued behind checkpoints — 63% of each
+                // worker's time. Large commits write row groups directly.
+                let mut writer = handle.event_writer()?;
                 let mut keys: HashMap<&'static str, KeyCounter> = HashMap::new();
-                let results = jobs
-                    .into_iter()
-                    .map(|job| {
-                        let report_records = |count: u64| {
-                            let records =
-                                records_parsed.fetch_add(count, Ordering::Relaxed) + count;
-                            on_progress(Progress {
-                                files_done: files_done.load(Ordering::Relaxed),
-                                files_total: total,
-                                records_parsed: records,
-                            });
-                        };
-                        let mut sink = BatchSink {
-                            on_stored: &report_records,
-                            keys: keys.entry(job.log_type.as_str()).or_default(),
-                        };
-                        busy.fetch_add(1, Ordering::Relaxed);
-                        let parsed = if cancelled(options) {
-                            None
-                        } else if let Some(note) = job.detection_error {
-                            Some(Err(note))
-                        } else {
-                            Some(match job.log_type {
-                                LogType::AlbAccess => parse_line_file(
-                                    &job.path,
-                                    &mut writer,
-                                    options,
-                                    &mut sink,
-                                    "ALB",
-                                    &spare_threads,
-                                    |line, fields, index| {
-                                        normalize_alb(
-                                            line,
-                                            fields,
-                                            job.file_id,
-                                            index,
-                                            options.keep_raw,
-                                        )
-                                    },
-                                ),
-                                log_type @ (LogType::WafAcl
-                                | LogType::ApigwAccess
-                                | LogType::NginxAccess) => parse_line_file(
-                                    &job.path,
-                                    &mut writer,
-                                    options,
-                                    &mut sink,
-                                    log_type.as_str(),
-                                    &spare_threads,
-                                    |line, _, index| {
-                                        crate::ndjson::normalize(
-                                            log_type,
-                                            line,
-                                            job.file_id,
-                                            index,
-                                            options.keep_raw,
-                                        )
-                                    },
-                                ),
-                                LogType::CloudTrail | LogType::Unknown => parse_cloudtrail_file(
-                                    &job.path,
-                                    job.file_id,
-                                    &mut writer,
-                                    options,
-                                    &mut sink,
-                                )
-                                .map(|count| ParsedFile {
-                                    count,
-                                    malformed: 0,
-                                }),
-                                LogType::CloudTrailDigest | LogType::ConfigSnapshot => {
-                                    Ok(ParsedFile::default())
-                                }
-                            })
-                        };
-                        busy.fetch_sub(1, Ordering::Relaxed);
-                        let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut results = Vec::new();
+                let mut json = Vec::new();
+                loop {
+                    let index = next_job.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(index) else {
+                        break;
+                    };
+                    let report_records = |count: u64| {
+                        let records = records_parsed.fetch_add(count, Ordering::Relaxed) + count;
                         on_progress(Progress {
-                            files_done: done,
+                            files_done: files_done.load(Ordering::Relaxed),
                             files_total: total,
-                            records_parsed: records_parsed.load(Ordering::Relaxed),
+                            records_parsed: records,
                         });
-                        JobResult {
-                            file_id: job.file_id,
-                            display: job.display,
-                            parsed,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                (results, keys)
+                    };
+                    let mut sink = BatchSink {
+                        writer: &mut writer,
+                        on_stored: &report_records,
+                        keys: keys.entry(job.log_type.as_str()).or_default(),
+                    };
+                    busy.fetch_add(1, Ordering::Relaxed);
+                    let parsed = if cancelled(options) {
+                        None
+                    } else if let Some(note) = &job.detection_error {
+                        Some(Err(note.clone()))
+                    } else {
+                        Some(match job.log_type {
+                            LogType::AlbAccess => parse_line_file(
+                                &job.path,
+                                options,
+                                &mut sink,
+                                "ALB",
+                                &spare_threads,
+                                |line, fields, index| {
+                                    normalize_alb(
+                                        line,
+                                        fields,
+                                        job.file_id,
+                                        index,
+                                        options.keep_raw,
+                                    )
+                                },
+                            ),
+                            log_type @ (LogType::WafAcl
+                            | LogType::ApigwAccess
+                            | LogType::NginxAccess) => parse_line_file(
+                                &job.path,
+                                options,
+                                &mut sink,
+                                log_type.as_str(),
+                                &spare_threads,
+                                |line, _, index| {
+                                    crate::ndjson::normalize(
+                                        log_type,
+                                        line,
+                                        job.file_id,
+                                        index,
+                                        options.keep_raw,
+                                    )
+                                },
+                            ),
+                            LogType::CloudTrail | LogType::Unknown => parse_cloudtrail_file(
+                                &job.path,
+                                job.file_id,
+                                options,
+                                &mut sink,
+                                &mut json,
+                            )
+                            .map(|count| ParsedFile {
+                                count,
+                                malformed: 0,
+                            }),
+                            LogType::CloudTrailDigest | LogType::ConfigSnapshot => {
+                                Ok(ParsedFile::default())
+                            }
+                        })
+                    };
+                    busy.fetch_sub(1, Ordering::Relaxed);
+                    let done = files_done.fetch_add(1, Ordering::Relaxed) + 1;
+                    on_progress(Progress {
+                        files_done: done,
+                        files_total: total,
+                        records_parsed: records_parsed.load(Ordering::Relaxed),
+                    });
+                    results.push(JobResult { job: index, parsed });
+                }
+                writer.finish()?;
+                Ok((results, keys))
             })
-            .collect::<Vec<_>>()
-    });
+            .collect::<Result<_, _>>()
+    })?;
     let mut payload_keys: HashMap<&'static str, KeyCounter> = HashMap::new();
-    let mut completed_jobs = Vec::new();
+    let mut completed_jobs = Vec::with_capacity(jobs.len());
     for (results, keys) in completed {
         completed_jobs.extend(results);
         for (log_type, counter) in keys {
@@ -306,49 +314,59 @@ pub fn run(
         cancelled: cancelled(options),
         ..Outcome::default()
     };
+    // Reports follow file order whichever worker finished a file first.
+    completed_jobs.sort_unstable_by_key(|result| result.job);
+    let mut marks: Vec<(u32, &'static str, Option<u64>, Option<String>)> =
+        Vec::with_capacity(completed_jobs.len());
     for result in completed_jobs {
+        let job = &jobs[result.job];
         match result.parsed {
             None => {
                 outcome.files_skipped += 1;
-                store.mark_file(
-                    result.file_id,
+                marks.push((
+                    job.file_id,
                     "skipped",
                     Some(0),
-                    Some("cancelled before parse"),
-                )?;
+                    Some("cancelled before parse".to_owned()),
+                ));
             }
             Some(Ok(ParsedFile { count: 0, .. })) => {
                 outcome.files_skipped += 1;
-                store.mark_file(
-                    result.file_id,
+                marks.push((
+                    job.file_id,
                     "skipped",
                     Some(0),
-                    Some("no supported log records"),
-                )?;
+                    Some("no supported log records".to_owned()),
+                ));
             }
             Some(Ok(ParsedFile { count, malformed })) => {
                 outcome.files_parsed += 1;
                 outcome.records_parsed += count;
                 let warning =
                     (malformed > 0).then(|| format!("{malformed} malformed ALB records skipped"));
-                store.mark_file(result.file_id, "parsed", Some(count), warning.as_deref())?;
-                if let Some(reason) = warning {
+                if let Some(reason) = &warning {
                     outcome.failures.push(FileFailure {
-                        display_path: result.display,
-                        reason,
+                        display_path: job.display.clone(),
+                        reason: reason.clone(),
                     });
                 }
+                marks.push((job.file_id, "parsed", Some(count), warning));
             }
             Some(Err(note)) => {
                 outcome.files_failed += 1;
-                store.mark_file(result.file_id, "failed", None, Some(&note))?;
                 outcome.failures.push(FileFailure {
-                    display_path: result.display,
-                    reason: note,
+                    display_path: job.display.clone(),
+                    reason: note.clone(),
                 });
+                marks.push((job.file_id, "failed", None, Some(note)));
             }
         }
     }
+    store.mark_files(
+        marks
+            .iter()
+            .map(|(file_id, status, count, note)| (*file_id, *status, *count, note.as_deref())),
+    )?;
 
     Ok(outcome)
 }
@@ -366,25 +384,31 @@ struct ParsedFile {
     malformed: u64,
 }
 
+/// Decompressed bytes up to which a CloudTrail file is parsed from memory.
+/// serde_json reads a slice far faster than an `io::Read`, which it pulls
+/// one byte per call; most of a parse went there. CloudTrail objects are a
+/// few MB, and a larger file streams on past this, so each worker holds at
+/// most this much.
+const IN_MEMORY_JSON_BYTES: u64 = 16 << 20;
+
 /// Streams one CloudTrail file. Returns the record count, or a short failure
 /// note. The `Records` array is consumed element by element: deserializing a
-/// top-level document into `Value` would hold the whole file in memory.
+/// top-level document into `Value` would hold every record at once.
+/// `buffer` is the worker's, reused across files.
 fn parse_cloudtrail_file(
     path: &Path,
     file_id: u32,
-    store: &mut Store,
     options: &ParseOptions,
-    sink: &mut BatchSink<'_>,
+    sink: &mut BatchSink<'_, '_>,
+    buffer: &mut Vec<u8>,
 ) -> Result<u64, String> {
+    use std::io::Read;
+
     let file = File::open(path).map_err(|e| format!("cannot open: {e}"))?;
-    let decoder = MultiGzDecoder::new(BufReader::new(file));
-    let mut reader = Deserializer::from_reader(BufReader::new(decoder));
+    let mut decoder = BufReader::new(MultiGzDecoder::new(BufReader::new(file)));
 
     let mut sink = RecordSink {
         sink,
-        writer: store
-            .event_writer()
-            .map_err(|error| format!("store writer failed: {error}"))?,
         options,
         batch: Vec::with_capacity(options.batch_size.min(4096)),
         file_id,
@@ -392,27 +416,25 @@ fn parse_cloudtrail_file(
         cancelled: false,
     };
 
-    // Concatenated gzip members yield several top-level documents in one
-    // stream; keep reading until the stream ends.
-    let mut damage = None;
-    loop {
-        match sink.deserialize_document(&mut reader) {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(message) => {
-                damage = Some(message);
-                break;
-            }
+    buffer.clear();
+    let damage = match (&mut decoder)
+        .take(IN_MEMORY_JSON_BYTES)
+        .read_to_end(buffer)
+    {
+        // Larger than the cap: the rest streams on after what was read.
+        Ok(_) if buffer.len() as u64 == IN_MEMORY_JSON_BYTES => sink.read_documents(
+            &mut Deserializer::from_reader(std::io::Cursor::new(&buffer[..]).chain(decoder)),
+        ),
+        Ok(_) => sink.read_documents(&mut Deserializer::from_slice(buffer)),
+        // A damaged stream still yields the records before the damage; the
+        // cut-off JSON there reads as a clean end, so report the damage.
+        Err(error) => {
+            sink.read_documents(&mut Deserializer::from_slice(buffer));
+            Some(crate::logging::redact(&error.to_string()))
         }
-        if sink.cancelled {
-            break;
-        }
-    }
+    };
 
     sink.flush()?;
-    sink.writer
-        .finish()
-        .map_err(|error| format!("store write failed: {error}"))?;
     // Trailing damage after usable records is reported, not fatal.
     match damage {
         Some(message) if sink.count == 0 => Err(message),
@@ -431,9 +453,8 @@ fn parse_cloudtrail_file(
 /// only cost scheduling (~6% on a 40-file ALB set), so it stays sequential.
 fn parse_line_file(
     path: &Path,
-    store: &mut Store,
     options: &ParseOptions,
-    sink: &mut BatchSink<'_>,
+    sink: &mut BatchSink<'_, '_>,
     kind: &str,
     spare_threads: &(dyn Fn() -> bool + Sync),
     normalize: impl Fn(&str, &mut Vec<Range<usize>>, u64) -> Result<NormalizedEvent, ()> + Sync,
@@ -441,9 +462,6 @@ fn parse_line_file(
     let file = File::open(path).map_err(|error| format!("cannot open: {error}"))?;
     let decoder = MultiGzDecoder::new(BufReader::new(file));
     let mut reader = BufReader::new(decoder);
-    let mut writer = store
-        .event_writer()
-        .map_err(|error| format!("store writer failed: {error}"))?;
     // Line buffers are reused across batches; `filled` bounds the live ones.
     let mut lines: Vec<String> = Vec::new();
     let mut batch = Vec::with_capacity(options.batch_size.min(4096));
@@ -493,12 +511,9 @@ fn parse_line_file(
                 Err(()) => parsed.malformed += 1,
             }
         }
-        flush_writer(&mut writer, &mut batch, sink)?;
+        flush_writer(&mut batch, sink)?;
     }
 
-    writer
-        .finish()
-        .map_err(|error| format!("store write failed: {error}"))?;
     if parsed.count == 0 && parsed.malformed > 0 {
         return Err(format!(
             "no valid {kind} records; {} malformed records",
@@ -726,37 +741,42 @@ fn endpoint_host(endpoint: &str) -> Option<&str> {
         .or_else(|| endpoint.rsplit_once(':').map(|(host, _)| host))
 }
 
-/// Where a flushed batch goes besides the store: the progress callback and
-/// the payload-key counter for the file's log type.
-struct BatchSink<'a> {
+/// Where a flushed batch goes: the worker's appender, the progress callback
+/// and the payload-key counter for the file's log type.
+struct BatchSink<'a, 'w> {
+    writer: &'a mut EventWriter<'w>,
     on_stored: &'a dyn Fn(u64),
     keys: &'a mut KeyCounter,
 }
 
 /// Consumes `{"Records":[...]}` one element at a time, flushing batches as it
 /// goes so peak memory is bounded by `batch_size`.
-struct RecordSink<'a, 'b> {
-    writer: EventWriter<'a>,
+struct RecordSink<'a, 'b, 'w> {
     options: &'a ParseOptions,
-    sink: &'a mut BatchSink<'b>,
+    sink: &'a mut BatchSink<'b, 'w>,
     batch: Vec<NormalizedEvent>,
     file_id: u32,
     count: u64,
     cancelled: bool,
 }
 
-impl RecordSink<'_, '_> {
-    /// Reads one top-level document. `Ok(false)` means the stream ended.
-    fn deserialize_document<R: std::io::Read>(
+impl RecordSink<'_, '_, '_> {
+    /// Reads top-level documents until the stream ends, the run is
+    /// cancelled, or the JSON is damaged; returns the damage. Concatenated
+    /// gzip members yield several documents in one stream.
+    fn read_documents<'de, R: serde_json::de::Read<'de>>(
         &mut self,
-        reader: &mut Deserializer<serde_json::de::IoRead<R>>,
-    ) -> Result<bool, String> {
+        reader: &mut Deserializer<R>,
+    ) -> Option<String> {
         use serde::de::DeserializeSeed;
 
-        match (DocumentSeed { sink: self }).deserialize(&mut *reader) {
-            Ok(()) => Ok(true),
-            Err(e) if e.is_eof() => Ok(false),
-            Err(e) => Err(crate::logging::redact(&e.to_string())),
+        loop {
+            match (DocumentSeed { sink: self }).deserialize(&mut *reader) {
+                Ok(()) if self.cancelled => return None,
+                Ok(()) => {}
+                Err(e) if e.is_eof() => return None,
+                Err(e) => return Some(crate::logging::redact(&e.to_string())),
+            }
         }
     }
 
@@ -776,16 +796,16 @@ impl RecordSink<'_, '_> {
     }
 
     fn flush(&mut self) -> Result<(), String> {
-        flush_writer(&mut self.writer, &mut self.batch, self.sink)
+        flush_writer(&mut self.batch, self.sink)
     }
 }
 
 /// Visits one top-level object, streaming its `Records` array into the sink.
-struct DocumentSeed<'a, 'b, 'c> {
-    sink: &'a mut RecordSink<'b, 'c>,
+struct DocumentSeed<'a, 'b, 'c, 'w> {
+    sink: &'a mut RecordSink<'b, 'c, 'w>,
 }
 
-impl<'de> serde::de::DeserializeSeed<'de> for DocumentSeed<'_, '_, '_> {
+impl<'de> serde::de::DeserializeSeed<'de> for DocumentSeed<'_, '_, '_, '_> {
     type Value = ();
 
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
@@ -793,7 +813,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for DocumentSeed<'_, '_, '_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for DocumentSeed<'_, '_, '_> {
+impl<'de> serde::de::Visitor<'de> for DocumentSeed<'_, '_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -816,11 +836,11 @@ impl<'de> serde::de::Visitor<'de> for DocumentSeed<'_, '_, '_> {
     }
 }
 
-struct RecordsSeed<'a, 'b, 'c> {
-    sink: &'a mut RecordSink<'b, 'c>,
+struct RecordsSeed<'a, 'b, 'c, 'w> {
+    sink: &'a mut RecordSink<'b, 'c, 'w>,
 }
 
-impl<'de> serde::de::DeserializeSeed<'de> for RecordsSeed<'_, '_, '_> {
+impl<'de> serde::de::DeserializeSeed<'de> for RecordsSeed<'_, '_, '_, '_> {
     type Value = ();
 
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
@@ -828,7 +848,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for RecordsSeed<'_, '_, '_> {
     }
 }
 
-impl<'de> serde::de::Visitor<'de> for RecordsSeed<'_, '_, '_> {
+impl<'de> serde::de::Visitor<'de> for RecordsSeed<'_, '_, '_, '_> {
     type Value = ();
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -857,9 +877,8 @@ impl<'de> serde::de::Visitor<'de> for RecordsSeed<'_, '_, '_> {
 /// untouched and the batch-level fan-out (`parse_line_file`) needs no
 /// shared state.
 fn flush_writer(
-    writer: &mut EventWriter<'_>,
     batch: &mut Vec<NormalizedEvent>,
-    sink: &mut BatchSink<'_>,
+    sink: &mut BatchSink<'_, '_>,
 ) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());
@@ -868,7 +887,7 @@ fn flush_writer(
     for event in batch.iter() {
         sink.keys.record_event(event);
     }
-    writer
+    sink.writer
         .append(batch)
         .map_err(|error| format!("store write failed: {error}"))?;
     batch.clear();

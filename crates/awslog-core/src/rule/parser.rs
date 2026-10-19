@@ -65,6 +65,7 @@ pub fn parse_rules(src: &str) -> Result<Vec<Rule>, ParseRuleError> {
         lines,
         pos: 0,
         at: 0,
+        inline: Vec::new(),
     };
     let mut rules = Vec::new();
     let mut seen = BTreeSet::new();
@@ -78,6 +79,23 @@ pub fn parse_rules(src: &str) -> Result<Vec<Rule>, ParseRuleError> {
     }
 
     Ok(rules)
+}
+
+/// A bare condition, as typed into a search box: what would follow
+/// `condition:` in a rule. Returns it as a rule named `search` whose fields
+/// are the inline conditions. Text that is not exactly one condition — a
+/// plain word, a `}` closing the rule early — is an error.
+pub fn parse_condition(text: &str) -> Result<Rule, ParseRuleError> {
+    // The newline keeps a trailing `// comment` off the closing brace.
+    let mut rules = parse_rules(&format!("rule search {{ condition: {text}\n}}"))?;
+    match (rules.pop(), rules.is_empty()) {
+        (Some(rule), true) if rule.meta.is_empty() => Ok(rule),
+        _ => Err(ParseRuleError::Syntax {
+            rule: "search".to_owned(),
+            line: 1,
+            message: "not a single condition".to_owned(),
+        }),
+    }
 }
 
 /// The original text of every rule in `src`, keyed by id, so an editor can
@@ -121,6 +139,9 @@ struct Parser {
     at: usize,
     /// Where "unexpected end of input" points: the line of the last token.
     last_line: usize,
+    /// Field conditions written straight into `condition:` of the rule
+    /// being parsed (`error_code == "X"` instead of a `$var`).
+    inline: Vec<FieldCondition>,
 }
 
 impl Parser {
@@ -183,6 +204,7 @@ impl Parser {
         let mut meta = BTreeMap::new();
         let mut fields = Vec::new();
         let mut condition = None;
+        self.inline.clear();
         let mut condition_start = 0;
 
         while self.peek() != Some(&Token::RBrace) {
@@ -210,6 +232,10 @@ impl Parser {
 
         let condition =
             condition.ok_or_else(|| self.syntax(&id, "missing `condition:` section".into()))?;
+
+        // Inline conditions are ordinary field conditions under generated
+        // names, so evaluation, evidence and filters treat them the same.
+        fields.append(&mut self.inline);
 
         // Every referenced variable must be declared, or the rule silently
         // never matches. The error points at the use, found by walking the
@@ -269,15 +295,7 @@ impl Parser {
                 unreachable!("peeked a var")
             };
             self.eat(&Token::Sym("="), rule)?;
-
-            let field = match self.next() {
-                Some(Token::Word(field)) => field,
-                other => {
-                    return Err(self.syntax(rule, format!("expected a field name, found {other:?}")))
-                }
-            };
-
-            let (op, value) = self.operator(rule)?;
+            let (field, op, value) = self.field_condition(rule)?;
             fields.push(FieldCondition {
                 var,
                 field,
@@ -286,6 +304,40 @@ impl Parser {
             });
         }
         Ok(fields)
+    }
+
+    /// `<field> <op> <value>`, the right-hand side of a `$var =`.
+    fn field_condition(&mut self, rule: &str) -> Result<(String, Op, Literal), ParseRuleError> {
+        let field = match self.next() {
+            Some(Token::Word(field)) => field,
+            other => {
+                return Err(self.syntax(rule, format!("expected a field name, found {other:?}")))
+            }
+        };
+        let (op, value) = self.operator(rule)?;
+        Ok((field, op, value))
+    }
+
+    /// Reads a field condition written in `condition:` and returns the name
+    /// it is bound to: the field itself, numbered from the second condition
+    /// on that field (`error_code`, `error_code#2`). The name is what the
+    /// evidence shows, and two conditions on one field must stay two
+    /// variables — one variable holds when *any* of its conditions does.
+    fn inline_condition(&mut self, rule: &str) -> Result<String, ParseRuleError> {
+        let (field, op, value) = self.field_condition(rule)?;
+        let earlier = self.inline.iter().filter(|f| f.field == field).count();
+        let var = if earlier == 0 {
+            field.clone()
+        } else {
+            format!("{field}#{}", earlier + 1)
+        };
+        self.inline.push(FieldCondition {
+            var: var.clone(),
+            field,
+            op,
+            value,
+        });
+        Ok(var)
     }
 
     fn operator(&mut self, rule: &str) -> Result<(Op, Literal), ParseRuleError> {
@@ -425,6 +477,7 @@ impl Parser {
                 Ok(Condition::Var(var))
             }
             Some(Token::Num(_)) => self.n_of(rule),
+            Some(Token::Word(_)) => Ok(Condition::Var(self.inline_condition(rule)?)),
             other => {
                 let message = format!("expected a condition, found {other:?}");
                 Err(self.syntax(rule, message))
@@ -450,10 +503,17 @@ impl Parser {
 
         let mut vars = Vec::new();
         loop {
-            match self.next() {
-                Some(Token::Var(var)) => vars.push(var),
+            match self.peek() {
+                Some(Token::Var(_)) => {
+                    let Some(Token::Var(var)) = self.next() else {
+                        unreachable!("peeked a var")
+                    };
+                    vars.push(var);
+                }
+                Some(Token::Word(_)) => vars.push(self.inline_condition(rule)?),
                 other => {
-                    return Err(self.syntax(rule, format!("`of` takes variables, found {other:?}")))
+                    let message = format!("`of` takes variables or conditions, found {other:?}");
+                    return Err(self.syntax(rule, message));
                 }
             }
             match self.next() {

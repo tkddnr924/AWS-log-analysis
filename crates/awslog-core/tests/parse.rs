@@ -115,6 +115,30 @@ fn a_damaged_file_is_reported_but_the_rest_still_parse() {
 }
 
 #[test]
+fn a_truncated_gzip_keeps_the_records_before_the_cut() {
+    // An interrupted download ends mid-stream. The records inflated before
+    // the cut are evidence; the file is not thrown away for its tail.
+    let json = cloudtrail_json(
+        &(0..2_000)
+            .map(|_| cloudtrail_record("ConsoleLogin"))
+            .collect::<Vec<_>>(),
+    );
+    let mut bytes = gzip(json.as_bytes());
+    bytes.truncate(bytes.len() * 3 / 5);
+    let dir = fixture_dir(&[("cut.json.gz", bytes)]);
+    let mut store = Store::create(&dir.path().join("s.duckdb"), "c1", "/logs").unwrap();
+
+    let outcome = parse::run(dir.path(), &mut store, &ParseOptions::default(), &|_| {}).unwrap();
+
+    assert_eq!(outcome.files_parsed, 1);
+    assert!(
+        (1..2_000).contains(&outcome.records_parsed),
+        "kept {} records",
+        outcome.records_parsed
+    );
+}
+
+#[test]
 fn progress_reports_reach_the_caller_during_the_run() {
     let json = cloudtrail_json(
         &(0..50)

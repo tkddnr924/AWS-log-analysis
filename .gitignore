@@ -38,6 +38,7 @@ AGENTS.md
 *.duckdb.wal
 *.duckdb.tmp
 /cases/
+/aws-log-analysis-cases/
 /sessions/
 /out/
 

@@ -14,16 +14,15 @@ import {
   type RuleOutline,
   type RuleProblem,
 } from "../bindings";
+import { appendCondition } from "../lib/ruleText";
 import { useApp } from "../state";
 
 const TEMPLATE = `rule my_rule {
     meta:
         name = "새 룰"
         severity = "medium"
-    fields:
-        $name = event_name == "ConsoleLogin"
     condition:
-        $name
+        event_name == "ConsoleLogin"
 }`;
 
 // Field paths take hyphens (`response.x-amz-server-side-encryption`), as
@@ -147,18 +146,18 @@ const PALETTE: Array<{
       ["or", " or "],
       ["not", "not "],
       ["( )", "()"],
-      ["N of (…)", "2 of ($a, $b)"],
+      ["N of (…)", "2 of (, )"],
     ],
   },
   {
     title: "조각",
     tone: "snippet",
     items: [
-      ["루트 사용", '$root = identity_type == "Root"'],
-      ["MFA 없음", "$nomfa = mfa_authenticated == false"],
-      ["실패한 호출", "$failed = error_code exists"],
-      ["삭제 계열", '$del = event_name startswith "Delete"'],
-      ["콘솔 로그인", '$login = event_name == "ConsoleLogin"'],
+      ["루트 사용", 'identity_type == "Root"'],
+      ["MFA 없음", "mfa_authenticated == false"],
+      ["실패한 호출", "error_code exists"],
+      ["삭제 계열", 'event_name startswith "Delete"'],
+      ["콘솔 로그인", 'event_name == "ConsoleLogin"'],
     ],
   },
 ];
@@ -172,12 +171,10 @@ const GRAMMAR_SHAPE = `rule my_rule {
         description = "설명"
         severity    = "medium"
         log_type    = "cloudtrail"
-    fields:
-        $a = event_name == "ConsoleLogin"
-        $b = request.bucketName startswith "prod-"
-        $c = response.status >= 500
     condition:
-        $a and ($b or not $c)
+        event_name == "ConsoleLogin"
+        and (request.bucketName startswith "prod-"
+             or not response.status >= 500)
 }`;
 
 const GRAMMAR_NOTES: ReadonlyArray<[term: string, note: ReactNode]> = [
@@ -186,10 +183,13 @@ const GRAMMAR_NOTES: ReadonlyArray<[term: string, note: ReactNode]> = [
   ["description", "선택; 무엇을 잡는지 한 줄"],
   ["severity", "low · medium · high"],
   ["log_type", "생략하면 모든 타입에 적용"],
-  ["fields", "조건 하나 = 변수 하나 ($a, $b …)"],
   [
     "condition",
-    "변수를 and · or · not · ( ) 로 조합, N of ($a, $b) = N개 이상",
+    "필드 연산 값 을 and · or · not · ( ) 로 조합, N of (조건, 조건) = N개 이상",
+  ],
+  [
+    "fields",
+    "선택; 같은 조건을 여러 번 쓸 때 $이름 = 조건 으로 이름 붙여 condition 에서 $이름 으로 참조",
   ],
   [
     "필드",
@@ -226,11 +226,11 @@ function problemText(problem: RuleProblem | null): ReactNode {
     </>
   );
   if (/expected a field name/.test(m))
-    return say("조건에 필드 이름이 빠졌습니다: $변수 = 필드 연산 값");
+    return say("조건에 필드 이름이 빠졌습니다: 필드 연산 값");
   if (/expected a value/.test(m))
     return say('연산 뒤에 값이 필요합니다: "문자열", 숫자, true/false');
   if (/expected a condition/.test(m))
-    return say("condition 에는 $변수와 and / or / not 만 쓸 수 있습니다");
+    return say("condition 에는 조건(필드 연산 값)과 and / or / not 을 씁니다");
   if (/undefined variable `(\$\w+)`/.test(m)) {
     return `condition 이 fields 에 없는 변수 ${m.match(/undefined variable `(\$\w+)`/)?.[1]} 를 씁니다`;
   }
@@ -253,7 +253,7 @@ function problemText(problem: RuleProblem | null): ReactNode {
   if (/`in` takes string values/.test(m))
     return say('in 안에는 "문자열" 만 쓸 수 있습니다');
   if (/`of` takes variables/.test(m))
-    return say("of ( ) 안에는 $변수만 쓸 수 있습니다");
+    return say("of ( ) 안에는 조건이나 $변수를 쉼표로 나열합니다");
   if (/expected `of` after a count/.test(m))
     return say("숫자 뒤에는 of ( … ) 가 와야 합니다");
   if (/expected `,` or `\)`/.test(m))
@@ -348,10 +348,8 @@ export function RuleEditor({
 
   const lines = useMemo(() => source.split("\n").length, [source]);
   const variables = useMemo(() => declaredVariables(source), [source]);
-  const [variableName, setVariableName] = useState("");
-  const [variableField, setVariableField] = useState("event_name");
-  // The variable builder is a row above the source that opens on demand:
-  // most edits are to text that already has its variables.
+  const [conditionField, setConditionField] = useState("event_name");
+  // The condition builder is a row above the source that opens on demand.
   const [building, setBuilding] = useState(false);
   const undefinedVariable =
     problem?.message.match(/undefined variable `(\$[A-Za-z0-9_]+)`/)?.[1] ??
@@ -369,9 +367,6 @@ export function RuleEditor({
     el.focus();
     el.setSelectionRange(at, at + (rows[errorLine - 1]?.length ?? 0));
   };
-  const variableExists = variables.some(
-    (variable) => variable.name === `$${variableName}`,
-  );
   // What the parsed data holds under request/response/resources, counted
   // while parsing (docs/04 "페이로드 키"). Nothing is declared for this;
   // it is how an analyst finds `request.bucketName` without reading JSON.
@@ -453,29 +448,38 @@ export function RuleEditor({
     replaceSelection(el.selectionStart, el.selectionEnd, text);
   };
 
-  const addVariable = () => {
-    const name = variableName.replace(/^\$/, "").trim();
-    const field = variableField.trim();
+  // Adds `<field> == ""` to the condition (`appendCondition`) and puts the
+  // caret between the quotes.
+  const addCondition = () => {
+    const field = conditionField.trim();
     // The same shape the lexer accepts as a field path.
-    if (!name || !/^[A-Za-z0-9_]+$/.test(name)) return;
     if (!/^[A-Za-z_][A-Za-z0-9_.\[\]-]*$/.test(field)) return;
-    if (variables.some((variable) => variable.name === `$${name}`)) return;
+    const next = appendCondition(source, `${field} == ""`);
+    if (!next) return;
+    const caret = next.caret - 1;
+    pendingSelection.current = [caret, caret];
+    setSource(next.source);
+    setError(null);
+    setHits(null);
+  };
 
-    const condition = source.match(/^[ \t]*condition\s*:/m);
-    if (condition?.index === undefined) return;
-    const fieldsStart = source.search(/\bfields\s*:/);
-    const fieldsSource = source.slice(
-      Math.max(0, fieldsStart),
-      condition.index,
-    );
-    const indent = fieldsSource.match(/^([ \t]+)\$/m)?.[1] ?? "        ";
-    const declaration = `${indent}$${name} = ${field} == ""\n`;
-    const valueStart = condition.index + declaration.lastIndexOf('""') + 1;
-    replaceSelection(condition.index, condition.index, declaration, [
-      valueStart,
-      valueStart,
-    ]);
-    setVariableName("");
+  // Enter keeps the line's indentation, one level deeper after a line
+  // that opens a block (`condition:`, `{`, `(`). A bare textarea put the
+  // caret at column 0. Skipped while an IME (Korean) is composing: that
+  // Enter commits the syllable.
+  const newline = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+    if (event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+    const el = event.currentTarget;
+    const start = el.selectionStart;
+    const line = source.slice(source.lastIndexOf("\n", start - 1) + 1, start);
+    const indent = line.match(/^[ \t]*/)?.[0] ?? "";
+    const text = `\n${indent}${/[:{(]\s*$/.test(line) ? "    " : ""}`;
+    event.preventDefault();
+    // insertText keeps the browser's undo history; React sees the input.
+    if (!document.execCommand("insertText", false, text)) {
+      replaceSelection(start, el.selectionEnd, text);
+    }
   };
 
   const replaceUndefinedVariable = (replacement: string) => {
@@ -578,7 +582,7 @@ export function RuleEditor({
                 aria-pressed={building}
                 onClick={() => setBuilding((b) => !b)}
               >
-                + 변수
+                + 조건
               </button>
               <button
                 onClick={() => void count()}
@@ -595,45 +599,25 @@ export function RuleEditor({
             </div>
             {building && (
               <div className="variable-builder">
-                <label>
-                  <span>$</span>
-                  <input
-                    autoFocus
-                    value={variableName}
-                    onChange={(event) =>
-                      setVariableName(
-                        event.target.value.replace(/[^A-Za-z0-9_]/g, ""),
-                      )
-                    }
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.preventDefault();
-                        addVariable();
-                      }
-                    }}
-                    placeholder="변수 이름"
-                    aria-label="새 변수 이름"
-                  />
-                </label>
-                <span className="muted">=</span>
                 {/* Typed, not picked: with the payload paths the list is
                     hundreds long. The datalist still offers every field
                     and path as you type. */}
                 <input
+                  autoFocus
                   className="variable-field"
                   list="rule-field-paths"
-                  value={variableField}
-                  onChange={(event) => setVariableField(event.target.value)}
+                  value={conditionField}
+                  onChange={(event) => setConditionField(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === "Enter") {
+                    if (event.key === "Enter" && !event.nativeEvent.isComposing) {
                       event.preventDefault();
-                      addVariable();
+                      addCondition();
                     }
                   }}
                   spellCheck={false}
                   autoComplete="off"
                   placeholder="필드 또는 경로 (예: request.bucketName)"
-                  aria-label="새 변수 필드"
+                  aria-label="새 조건의 필드"
                 />
                 <datalist id="rule-field-paths">
                   {mapping.map((entry) => (
@@ -647,11 +631,8 @@ export function RuleEditor({
                     </option>
                   ))}
                 </datalist>
-                <button
-                  onClick={addVariable}
-                  disabled={!variableName || variableExists}
-                >
-                  {variableExists ? "이미 선언됨" : "fields에 추가"}
+                <button onClick={addCondition} disabled={!conditionField.trim()}>
+                  condition에 추가
                 </button>
               </div>
             )}
@@ -690,6 +671,7 @@ export function RuleEditor({
                       gutter.current.scrollTop = e.currentTarget.scrollTop;
                     }
                   }}
+                  onKeyDown={newline}
                   onChange={(e) => {
                     setSource(e.target.value);
                     setError(null);
@@ -754,11 +736,13 @@ export function RuleEditor({
               <h3>
                 조각<span>끌어 놓거나 눌러서 넣기</span>
               </h3>
-              <div className="chip-group">
-                <h4>변수</h4>
-                <div>
-                  {variables.length > 0 ? (
-                    variables.map((v) =>
+              {/* Only for rules that declare `$name = …` in `fields:`;
+                  conditions are usually written straight into condition. */}
+              {variables.length > 0 && (
+                <div className="chip-group">
+                  <h4>변수</h4>
+                  <div>
+                    {variables.map((v) =>
                       chip(
                         v.name,
                         v.name,
@@ -766,14 +750,10 @@ export function RuleEditor({
                         "variable",
                         `${v.field} 조건을 참조`,
                       ),
-                    )
-                  ) : (
-                    <span className="chip-empty">
-                      fields에 선언한 변수가 여기 나타납니다 (+ 변수)
-                    </span>
-                  )}
+                    )}
+                  </div>
                 </div>
-              </div>
+              )}
               <div className="chip-group">
                 <h4>필드</h4>
                 <div>

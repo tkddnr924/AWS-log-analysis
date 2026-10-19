@@ -1371,6 +1371,187 @@ fn conditions_no_prefilter_can_narrow_still_see_every_event() {
 }
 
 #[test]
+fn every_pushed_down_filter_keeps_exactly_the_evaluators_hits() {
+    // The scan lets DuckDB drop rows a rule cannot match. Counted with the
+    // filter, each rule must hit exactly what the evaluator finds over the
+    // events as they were appended — not as a scan reads them back, which
+    // would hide a column the scan fails to restore. The bodies are
+    // rendered by serde_json, as the parsers do.
+    let json = |value: serde_json::Value| Some(value.to_string());
+    let mut events = vec![
+        event(0, "ConsoleLogin"),
+        event(1, "consolelogin"),
+        event(2, "DeleteTrail"),
+        event(3, "AssumeRole"),
+        event(4, "GetObject"),
+        event(5, "PutObject"),
+    ];
+    events[0].user_agent = Some("Mozilla AWS-CLI/2".into());
+    events[0].request = json(serde_json::json!({
+        "bucketName": "b\"q",
+        "durationSeconds": 43200,
+        "enable": false,
+        "withDecryption": "true",
+        "tags": {"k": "v"},
+    }));
+    events[0].response = json(serde_json::json!({
+        "ConsoleLogin": "Failure",
+        "status": 503,
+        "elb_status_code": "500",
+        "match_details": [{"conditionType": "SQL_INJECTION", "location": "BODY"}],
+    }));
+    events[0].resources = json(serde_json::json!([{"ARN": "arn:aws:s3:::x"}]));
+    events[1].user_agent = Some("ÄWS-cli İnside".into());
+    events[1].response = json(serde_json::json!({"ConsoleLogin": "Success", "status": "404"}));
+    events[1].request = json(serde_json::json!({"bucketName": "plain", "durationSeconds": "100"}));
+    let blank = &mut events[2];
+    blank.event_source = None;
+    blank.aws_region = None;
+    blank.identity_type = None;
+    blank.identity_arn = None;
+    blank.source_ip = None;
+    blank.raw = None;
+    blank.mfa_authenticated = None;
+    events[3].response =
+        json(serde_json::json!({"status": 500.0, "tags": {"ConsoleLogin": "Failure"}}));
+    events[3].request = json(serde_json::json!({
+        "policyArn": "arn:aws:iam::aws:policy/AdministratorAccess",
+        "enable": "false",
+        "note": "line\nbreak \"quoted\"\ttab",
+    }));
+    events[3].user_agent = Some("aws-cli/1.0".into());
+    events[3].error_code = Some("AccessDenied".into());
+    events[4].response = json(serde_json::json!("Failure"));
+    events[4].request = json(serde_json::json!(true));
+    events[4].mfa_authenticated = Some(true);
+    // Field order as a `#[derive(Serialize)]` struct writes it (ALB), not the
+    // sorted order the evaluator re-renders an object in.
+    events[5].response = Some(r#"{"status":200,"count":5,"obj":{"z":2,"a":1}}"#.into());
+    events[5].request = json(serde_json::json!({"items": [1, 2], "flag": true}));
+    events[5].error_code = Some("".into());
+    // Whole microseconds: the precision the table keeps.
+    events[0].event_time = Some(datetime!(2026-09-11 02:03:04.123456 UTC));
+    events[3].event_time = Some(datetime!(2026-09-12 00:00:00 UTC));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    store.append_events(&events).unwrap();
+
+    let conditions = [
+        r#"event_name == "ConsoleLogin""#,
+        r#"event_name != "ConsoleLogin""#,
+        r#"event_name == true"#,
+        r#"event_name in ("DeleteTrail", "consolelogin")"#,
+        r#"event_name contains "Log""#,
+        r#"event_name startswith "Get""#,
+        r#"event_name endswith "Object""#,
+        r#"event_name icontains "LOGIN""#,
+        r#"event_name istartswith "CONSOLE""#,
+        r#"event_name iendswith "OBJECT""#,
+        r#"user_agent icontains "aws-cli""#,
+        r#"user_agent icontains "äws""#,
+        r#"user_agent istartswith "äws""#,
+        r#"error_code == """#,
+        r#"error_code exists"#,
+        r#"error_code missing"#,
+        r#"error_code matches /^Access/"#,
+        r#"source_ip > 5"#,
+        r#"mfa_authenticated == true"#,
+        r#"mfa_authenticated == false"#,
+        r#"mfa_authenticated == "true""#,
+        r#"mfa_authenticated missing"#,
+        r#"event_time exists"#,
+        r#"event_time missing"#,
+        r#"event_time startswith "2026-09-11""#,
+        r#"response == "\"Failure\"""#,
+        r#"response contains "SQL_INJECTION""#,
+        r#"request == true"#,
+        r#"raw contains "DeleteTrail""#,
+        r#"raw missing"#,
+        r#"response.ConsoleLogin == "Failure""#,
+        r#"response.ConsoleLogin != "Failure""#,
+        r#"response.ConsoleLogin in ("Success", "Other")"#,
+        r#"response.ConsoleLogin icontains "fail""#,
+        r#"response.ConsoleLogin missing"#,
+        r#"response.status == "503""#,
+        r#"response.status == "404""#,
+        r#"response.status == 500"#,
+        r#"response.status >= 500"#,
+        r#"response.status in ("500", "404")"#,
+        r#"response.elb_status_code == "500""#,
+        r#"response.match_details contains "\"conditionType\":\"SQL_INJECTION\"""#,
+        r#"response.match_details icontains "sql_injection""#,
+        r#"response.tags == "{\"ConsoleLogin\":\"Failure\"}""#,
+        r#"response.tags contains "ConsoleLogin\":\"Fail""#,
+        r#"response.tags in ("{\"ConsoleLogin\":\"Failure\"}")"#,
+        r#"request.bucketName == "b\"q""#,
+        r#"request.bucketName contains "\"q""#,
+        r#"request.durationSeconds > 14400"#,
+        r#"request.durationSeconds == "100""#,
+        r#"request.enable == false"#,
+        r#"request.withDecryption == true"#,
+        r#"request.tags.k == "v""#,
+        r#"request.note contains "break \"quoted\"""#,
+        r#"request.note endswith "tab""#,
+        r#"request.items contains "1,2""#,
+        r#"response.obj contains "a\":1,\"z""#,
+        r#"request.flag in ("true")"#,
+        r#"request.policyArn in ("arn:aws:iam::aws:policy/AdministratorAccess")"#,
+        r#"resources contains "arn:aws:s3""#,
+        r#"raw.eventName == "DeleteTrail""#,
+        r#"nonexistent == "x""#,
+        r#"nonexistent missing"#,
+        r#"event_name.x missing"#,
+    ];
+    for condition in conditions {
+        for shape in [
+            "$a",
+            "not $a",
+            "$a and $b",
+            "$a or $b",
+            "$a or not $b",
+            "1 of ($a, $b)",
+            "2 of ($a, $b)",
+            "3 of ($a, $b)",
+        ] {
+            let source = format!(
+                r#"rule r {{ fields: $a = {condition}
+                                    $b = event_name == "AssumeRole"
+                                    $b = response.ConsoleLogin == "Failure"
+                            condition: {shape} }}"#
+            );
+            let set = RuleSet::from_source(&source).unwrap();
+            let expected = events
+                .iter()
+                .filter(|event| {
+                    awslog_core::rule::evaluate_any(set.for_log_type("cloudtrail"), event)
+                })
+                .count() as u64;
+            let counted = results::count_matches(&store, &set, || false).unwrap();
+            assert_eq!(counted.hits, expected, "{condition} under {shape}");
+            assert_eq!(counted.scanned, events.len() as u64);
+        }
+    }
+    // The battery is not vacuous: filters that do narrow still find these.
+    let hits = |source: &str| {
+        results::count_matches(&store, &RuleSet::from_source(source).unwrap(), || false)
+            .unwrap()
+            .hits
+    };
+    assert_eq!(
+        hits(r#"rule x { fields: $a = response.ConsoleLogin == "Failure" condition: $a }"#),
+        1
+    );
+    assert_eq!(
+        hits(r#"rule x { fields: $a = request.bucketName == "b\"q" condition: $a }"#),
+        1
+    );
+}
+
+#[test]
 fn a_run_past_one_hit_batch_keeps_every_rows_summary() {
     // Hits are persisted in 10,000-row batches, each re-reading its events'
     // summaries from `events`. A rule that hits nearly everything is the
@@ -1900,5 +2081,200 @@ fn page_boundaries_preserve_timestamp_precision_ties_and_nulls() {
             assert!(after.is_none(), "the page after the last row is empty");
             assert_eq!(actual, expected);
         }
+    }
+}
+
+#[test]
+fn a_condition_typed_into_the_search_pages_like_a_rule() {
+    let mut events = vec![
+        event(0, "ConsoleLogin"),
+        event(1, "AssumeRole"),
+        event(2, "ConsoleLogin"),
+        event(3, "DeleteTrail"),
+    ];
+    events[0].error_code = Some("AccessDenied".into());
+    events[1].error_code = Some("UnauthorizedOperation".into());
+    events[3].error_code = Some("AccessDenied".into());
+    let (_tmp, mut store, set) = unevaluated(
+        &events,
+        r#"rule login { fields: $n = event_name == "ConsoleLogin" condition: $n }"#,
+    );
+    let query = awslog_core::rule::parse_condition(
+        "error_code matches /AccessDenied|UnauthorizedOperation/",
+    )
+    .unwrap();
+    let page = |store: &Store| {
+        results::rule_matches(
+            store,
+            results::SEARCH_RULE_ID,
+            &Window {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+
+    // Over the whole case.
+    assert_eq!(
+        results::search_condition(&mut store, None, &query, || false).unwrap(),
+        3
+    );
+    assert_eq!(
+        names(&page(&store)),
+        ["ConsoleLogin", "AssumeRole", "DeleteTrail"]
+    );
+
+    // Within a rule: its condition and the query, both. The query's
+    // `error_code` and a rule variable of the same name stay separate.
+    let within = set.rule("login").unwrap();
+    assert_eq!(
+        results::search_condition(&mut store, Some(within), &query, || false).unwrap(),
+        1
+    );
+    let rows = page(&store).rows;
+    assert_eq!(rows.len(), 1, "the previous search is replaced");
+    assert_eq!(rows[0].event_id, 0);
+
+    // A search is not a rule: the sidebar neither lists it nor counts it.
+    let sidebar = results::query(&store, &Window::default()).unwrap();
+    assert!(sidebar
+        .groups
+        .iter()
+        .all(|g| g.rule_id != results::SEARCH_RULE_ID));
+    assert_eq!(sidebar.matched_events, 0);
+}
+
+#[test]
+fn plain_search_text_is_not_taken_for_a_condition() {
+    for text in [
+        "ConsoleLogin",
+        "AccessDenied UnauthorizedOperation",
+        "43.201",
+        "2026-09-11",
+        "event_name ==",
+        r#"event_name == "x" } rule other { condition: event_name exists"#,
+    ] {
+        assert!(
+            awslog_core::rule::parse_condition(text).is_err(),
+            "{text:?} read as a condition"
+        );
+    }
+    assert!(awslog_core::rule::parse_condition(r#"not event_name == "x" // note"#).is_ok());
+}
+
+/// Two cloudtrail files and one ALB file; `login` hits the ConsoleLogins.
+fn stats_case() -> (tempfile::TempDir, Store) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    store.register_file(1, "b.log.gz", 1, "alb_access").unwrap();
+    let mut rows = Vec::new();
+    for (i, (name, ip, day)) in [
+        ("ConsoleLogin", Some("203.0.113.10"), 11),
+        ("ConsoleLogin", Some("203.0.113.10"), 11),
+        ("ConsoleLogin", Some("198.51.100.7"), 12),
+        ("GetObject", Some("203.0.113.10"), 12),
+        ("GetObject", None, 13),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut e = event(i as u64, name);
+        e.source_ip = ip.map(Into::into);
+        e.event_time = Some(datetime!(2026-09-11 01:00:00 UTC).replace_day(day).unwrap());
+        e.request = Some(format!(r#"{{"bucketName":"bucket-{}"}}"#, i % 2));
+        rows.push(e);
+    }
+    let mut alb = event(0, "GET");
+    alb.file_id = 1;
+    alb.source_ip = Some("203.0.113.10".into());
+    rows.push(alb);
+    store.append_events(&rows).unwrap();
+    let set = RuleSet::from_source(
+        r#"rule login { fields: $n = event_name == "ConsoleLogin" condition: $n }"#,
+    )
+    .unwrap();
+    store
+        .writer_handle()
+        .unwrap()
+        .begin_rule_run(set.rules())
+        .unwrap();
+    results::evaluate_rule(&mut store, set.rule("login").unwrap(), || false).unwrap();
+    (tmp, store)
+}
+
+fn counts(stats: &results::FieldStats) -> Vec<(Option<&str>, u64)> {
+    stats
+        .values
+        .iter()
+        .map(|v| (v.value.as_deref(), v.count))
+        .collect()
+}
+
+#[test]
+fn field_stats_count_each_value_of_the_filtered_list() {
+    let (_tmp, store) = stats_case();
+    let cloudtrail = Window {
+        log_type: Some("cloudtrail".into()),
+        ..Default::default()
+    };
+
+    // All events of the tab, most frequent first; a missing value is its own row.
+    let ips = results::field_stats(&store, None, "source_ip", &cloudtrail).unwrap();
+    assert_eq!(
+        counts(&ips),
+        [
+            (Some("203.0.113.10"), 3),
+            (Some("198.51.100.7"), 1),
+            (None, 1)
+        ]
+    );
+    assert_eq!((ips.total, ips.distinct), (5, 3));
+
+    // One rule's matches.
+    let ips = results::field_stats(&store, Some("login"), "source_ip", &cloudtrail).unwrap();
+    assert_eq!(
+        counts(&ips),
+        [(Some("203.0.113.10"), 2), (Some("198.51.100.7"), 1)]
+    );
+
+    // The date range and the text search narrow it like the list.
+    let narrowed = Window {
+        from: Some("2026-09-12".into()),
+        search: "GetObject".into(),
+        ..cloudtrail.clone()
+    };
+    let names = results::field_stats(&store, None, "event_name", &narrowed).unwrap();
+    assert_eq!(counts(&names), [(Some("GetObject"), 2)]);
+
+    // Days in KST, and payload paths.
+    let days = results::field_stats(&store, Some("login"), "day", &cloudtrail).unwrap();
+    assert_eq!(
+        counts(&days),
+        [(Some("2026-09-11"), 2), (Some("2026-09-12"), 1)]
+    );
+    let buckets = results::field_stats(&store, None, "request.bucketName", &cloudtrail).unwrap();
+    assert_eq!(
+        counts(&buckets),
+        [(Some("bucket-0"), 3), (Some("bucket-1"), 2)]
+    );
+}
+
+#[test]
+fn field_stats_refuse_a_field_they_cannot_name() {
+    let (_tmp, store) = stats_case();
+    for field in [
+        "nope",
+        "raw",
+        "request.a'b",
+        "event_name; DROP TABLE events",
+    ] {
+        assert!(
+            results::field_stats(&store, None, field, &Window::default()).is_err(),
+            "{field}"
+        );
     }
 }

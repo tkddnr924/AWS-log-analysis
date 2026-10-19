@@ -4,32 +4,52 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
+use duckdb::arrow::array::{Array, ArrayRef, AsArray};
+use duckdb::arrow::datatypes::{DataType, Int64Type, UInt32Type, UInt64Type};
 use duckdb::types::{TimeUnit, Value};
 use duckdb::{params, Appender, Connection};
 use time::OffsetDateTime;
 
 use crate::model::NormalizedEvent;
-use crate::rule::{Condition, FieldCondition, Literal, Op, Rule};
+use crate::rule::Rule;
+
+mod candidate;
+use candidate::{renders_raw, Candidates};
 
 const SCHEMA: &str = include_str!("store/schema.sql");
 
-/// The summary a results row shows, projected from `events e`: the id, the
-/// time twice (raw for storing and comparing, KST text for display), then
-/// the display columns. HTTP-style fields (ALB, WAF, API Gateway, nginx)
-/// come out of the JSON bodies; CloudTrail rows get NULLs there.
-const EVENT_SUMMARY_COLUMNS: &str = "e.event_id, epoch_us(e.event_time),
-    strftime(e.event_time + INTERVAL 9 HOUR, '%Y-%m-%d %H:%M:%S.%g'),
-    e.event_name, e.event_source, e.identity_arn, e.source_ip,
-    json_extract_string(e.request, '$.url'),
-    coalesce(json_extract_string(e.response, '$.elb_status_code'),
-             json_extract_string(e.response, '$.status')),
-    coalesce(json_extract_string(e.resources, '$.target'),
-             json_extract_string(e.resources, '$.host')),
-    e.user_agent, e.aws_region, e.error_code,
-    json_extract_string(e.resources, '$[0].ARN'),
-    json_extract_string(e.request, '$.country'),
-    json_extract_string(e.response, '$.terminating_rule_id'),
-    json_extract_string(e.request, '$.method')";
+/// On-disk format of new case databases. DuckDB defaults to the v0.10
+/// format for compatibility, which lacks ZSTD string compression; the JSON
+/// columns need it (schema.sql). Existing cases keep the format they have.
+const STORAGE_VERSION: &str = "v1.4.0";
+
+/// The display columns of a results row, projected from `events e`.
+/// HTTP-style fields (ALB, WAF, API Gateway, nginx) come out of the JSON
+/// bodies; CloudTrail rows get NULLs there. A macro so both the summary
+/// read and the match insert (`Store::append_match_batch`) splice it.
+macro_rules! summary_text_columns {
+    () => {
+        "e.event_name, e.event_source, e.identity_arn, e.source_ip,
+        json_extract_string(e.request, '$.url'),
+        coalesce(json_extract_string(e.response, '$.elb_status_code'),
+                 json_extract_string(e.response, '$.status')),
+        coalesce(json_extract_string(e.resources, '$.target'),
+                 json_extract_string(e.resources, '$.host')),
+        e.user_agent, e.aws_region, e.error_code,
+        json_extract_string(e.resources, '$[0].ARN'),
+        json_extract_string(e.request, '$.country'),
+        json_extract_string(e.response, '$.terminating_rule_id'),
+        json_extract_string(e.request, '$.method')"
+    };
+}
+
+/// The summary a results row shows: the id, the time twice (raw for
+/// storing and comparing, KST text for display), then the display columns.
+const EVENT_SUMMARY_COLUMNS: &str = concat!(
+    "e.event_id, epoch_us(e.event_time),
+    strftime(e.event_time + INTERVAL 9 HOUR, '%Y-%m-%d %H:%M:%S.%g'), ",
+    summary_text_columns!()
+);
 
 /// The same summary read back from `rule_matches e`, where it was stored
 /// by [`Store::append_match_batch`]. Same positions as
@@ -92,6 +112,10 @@ pub enum StoreError {
     BadDateTime(String),
     #[error("rule evaluation failed: {0}")]
     RuleRun(String),
+    #[error("unexpected column type in scan result: {0}")]
+    ColumnType(String),
+    #[error("통계를 낼 수 없는 필드입니다: {0}")]
+    UnknownField(String),
     // A run the user walked away from. Not a failure: the work is simply
     // not recorded, and the next attempt starts over.
     #[error("작업이 취소되었습니다")]
@@ -174,8 +198,11 @@ enum SearchShape {
     TextOrTime,
 }
 
-/// A long-lived events appender. One parser file reuses it across every
-/// bounded batch, avoiding a DuckDB flush and appender rebuild per 10,000 rows.
+/// A long-lived events appender. A parser worker reuses it across every
+/// bounded batch of every file it reads, so DuckDB commits per flush rather
+/// than per file. (Appending inside one long transaction instead, so full
+/// row groups are written directly, measured slower — 10.5s → 12.9s — and
+/// left a 75% larger database.)
 pub struct EventWriter<'a> {
     appender: Appender<'a>,
     /// Text bytes handed to the appender since its last flush.
@@ -184,11 +211,11 @@ pub struct EventWriter<'a> {
 
 /// DuckDB's appender buffers up to 204,800 rows outside the buffer pool
 /// (`memory_limit` does not see them) before it commits. Rows with multi-KB
-/// JSON bodies times four workers put that in the GBs, so the writer also
-/// commits by bytes. 256 MiB: a 478k-row nginx file (3.5 KB rows) peaked at
-/// 1.84 GB RSS unbounded, 1.51 GB here, 1.33 GB at 64 MiB — but 64 MiB made
-/// every commit smaller than a row group and cost 15% on that file.
-const APPENDER_FLUSH_BYTES: usize = 256 << 20;
+/// JSON bodies times eight workers put that in the GBs, so the writer also
+/// commits by bytes. 1.09M CloudTrail records, eight workers: 256 MiB
+/// 21.0s / 3.8 GB RSS, 64 MiB 11.4s / 1.9 GB, 32 MiB 11.9s / 1.4 GB,
+/// 16 MiB 12.1s / 1.2 GB.
+pub(crate) const APPENDER_FLUSH_BYTES: usize = 32 << 20;
 
 impl EventWriter<'_> {
     pub fn append(&mut self, events: &[NormalizedEvent]) -> Result<(), StoreError> {
@@ -284,7 +311,10 @@ impl Store {
 
     /// Creates the database and its schema, then records the case row.
     pub fn create(path: &Path, case_id: &str, input_dir: &str) -> Result<Self, StoreError> {
-        let conn = Connection::open(path)?;
+        let conn = Connection::open_with_flags(
+            path,
+            duckdb::Config::default().with("storage_compatibility_version", STORAGE_VERSION)?,
+        )?;
         Self::configure(&conn)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute(
@@ -411,24 +441,50 @@ impl Store {
         size_bytes: u64,
         log_type: &str,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO files (file_id, path, size_bytes, log_type, status)
-             VALUES (?, ?, ?, ?, 'pending')",
-            params![file_id, path, size_bytes, log_type],
+        self.register_files([(file_id, path, size_bytes, log_type)])
+    }
+
+    /// Registers `(file_id, path, size_bytes, log_type)` rows as `pending`
+    /// in one append. A statement per file was an autocommit with its own
+    /// WAL sync; a corpus holds millions of files.
+    pub fn register_files<'a>(
+        &mut self,
+        files: impl IntoIterator<Item = (u32, &'a str, u64, &'a str)>,
+    ) -> Result<(), StoreError> {
+        let mut appender = self.conn.appender_with_columns(
+            "files",
+            &["file_id", "path", "size_bytes", "log_type", "status"],
         )?;
+        for (file_id, path, size_bytes, log_type) in files {
+            appender.append_row(params![file_id, path, size_bytes, log_type, "pending"])?;
+        }
+        appender.flush()?;
         Ok(())
     }
 
-    pub fn mark_file(
+    /// Records each file's outcome, `(file_id, status, record_count, note)`,
+    /// with one join update instead of an autocommit per file.
+    pub fn mark_files<'a>(
         &mut self,
-        file_id: u32,
-        status: &str,
-        record_count: Option<u64>,
-        note: Option<&str>,
+        marks: impl IntoIterator<Item = (u32, &'a str, Option<u64>, Option<&'a str>)>,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE files SET status = ?, record_count = ?, note = ? WHERE file_id = ?",
-            params![status, record_count, note, file_id],
+        self.conn.execute_batch(
+            "CREATE OR REPLACE TEMP TABLE file_marks
+                 (file_id UINTEGER, status VARCHAR, record_count UBIGINT, note VARCHAR)",
+        )?;
+        {
+            let mut appender =
+                self.conn
+                    .appender_to_catalog_and_db("file_marks", "temp", "main")?;
+            for (file_id, status, record_count, note) in marks {
+                appender.append_row(params![file_id, status, record_count, note])?;
+            }
+            appender.flush()?;
+        }
+        self.conn.execute_batch(
+            "UPDATE files SET status = m.status, record_count = m.record_count, note = m.note
+             FROM temp.file_marks m WHERE files.file_id = m.file_id;
+             DROP TABLE temp.file_marks;",
         )?;
         Ok(())
     }
@@ -469,7 +525,8 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Opens one long-lived appender for a parser file.
+    /// Opens one long-lived appender. A parser worker keeps it across all
+    /// the files it reads (`parse::run`).
     pub fn event_writer(&mut self) -> Result<EventWriter<'_>, StoreError> {
         let appender = self.conn.appender("events")?;
         Ok(EventWriter {
@@ -479,7 +536,7 @@ impl Store {
     }
 
     /// Bulk-loads a standalone batch. Parsers should use [`Self::event_writer`]
-    /// to reuse one appender across all batches in a file.
+    /// to reuse one appender across all the batches they write.
     pub fn append_events(&mut self, events: &[NormalizedEvent]) -> Result<(), StoreError> {
         let mut writer = self.event_writer()?;
         writer.append(events)?;
@@ -610,8 +667,7 @@ impl Store {
         &self,
         mut visit: impl FnMut(u64, NormalizedEvent),
     ) -> Result<(), StoreError> {
-        // Files ascend and ids are `file_id << 32 | record_index`, so
-        // per-file record order is global id order.
+        // Ranges ascend and each is sorted by id (`scan_events`).
         self.for_each_typed_event(|id, _, event| visit(id, event))
     }
 
@@ -623,17 +679,17 @@ impl Store {
         self.scan_events(None, |_| true, visit, || false)
     }
 
-    /// Streams stored events for rule evaluation, in `file_id` then
-    /// `record_index` order, with each file's detected log type.
+    /// Streams stored events in `event_id` (= `file_id`, then
+    /// `record_index`) order, with each file's detected log type.
     ///
     /// `columns` limits which event columns are read; the rest come back
     /// `None`. A rule only looks at the columns it names, so reading the
     /// JSON bodies for a rule on `event_name` would be pure cost. `None`
     /// reads everything. `wants` skips whole files by log type.
     ///
-    /// `cancelled` is polled before the first query, at every file, chunk
-    /// and row boundary and once the pass is over, so a run the user
-    /// abandoned stops promptly and never reports success. It returns
+    /// `cancelled` is polled before the first query, at every range and row
+    /// boundary and once the pass is over, so a run the user abandoned
+    /// stops promptly and never reports success. It returns
     /// [`StoreError::Cancelled`]; callers that cannot be cancelled pass
     /// `|| false`.
     pub fn scan_events(
@@ -643,7 +699,14 @@ impl Store {
         visit: impl FnMut(u64, &str, NormalizedEvent),
         cancelled: impl Fn() -> bool,
     ) -> Result<(), StoreError> {
-        self.scan_files(columns, None, wants, visit, cancelled)?;
+        self.scan_files(
+            columns,
+            &Candidates::default(),
+            wants,
+            visit,
+            cancelled,
+            true,
+        )?;
         Ok(())
     }
 
@@ -668,116 +731,140 @@ impl Store {
         cancelled: impl Fn() -> bool,
     ) -> Result<u64, StoreError> {
         let columns: BTreeSet<&str> = rules.iter().copied().flat_map(Rule::columns).collect();
-        let candidate = set_candidate(rules);
         self.scan_files(
             Some(&columns),
-            candidate.as_ref(),
+            &Candidates::for_rules(rules),
             |log_type| rules.iter().any(|rule| rule.applies_to(log_type)),
             visit,
             cancelled,
+            false,
         )
     }
 
     /// The pass both entry points run; returns the case's stored event count.
     ///
-    /// Reads go in bounded chunks, not one query over the table:
-    /// `duckdb-rs` materializes a query's whole result, and one holding
-    /// every event with its JSON columns reached ~2.5 GB per million rows.
-    /// Chunking by `record_index` range inside each file keeps that bound
-    /// independent of both the case size and the largest file.
+    /// One query per `event_id` range of at most `chunk` stored rows. A range
+    /// spans as many consecutive wanted files as fit, so a corpus of small
+    /// files costs a handful of queries instead of one per file; a file
+    /// larger than `chunk` is split by `record_index`. Results are streamed,
+    /// so memory holds one DuckDB vector, not one range. `ordered` sorts
+    /// each range by id, which DuckDB must hold while sorting, so those
+    /// ranges stay small.
     fn scan_files(
         &self,
         columns: Option<&BTreeSet<&str>>,
-        candidate: Option<&Candidate>,
-        mut wants: impl FnMut(&str) -> bool,
+        candidates: &Candidates,
+        wants: impl FnMut(&str) -> bool,
         mut visit: impl FnMut(u64, &str, NormalizedEvent),
         cancelled: impl Fn() -> bool,
+        ordered: bool,
     ) -> Result<u64, StoreError> {
-        const CHUNK: u64 = 50_000;
+        let chunk: u64 = if ordered { 50_000 } else { 1_000_000 };
         if cancelled() {
             return Err(StoreError::Cancelled);
         }
         let files = self.file_spans()?;
         let stored = files.iter().map(|file| file.rows).sum();
+        // Files whose `raw` filters differently are kept in ranges of their
+        // own, each scanned with its own candidate.
+        let split = candidates.split();
+        let ranges = scan_ranges(&files, chunk, wants, |log_type| {
+            split && renders_raw(log_type)
+        });
         // Unselected columns are projected as NULL so row positions stay fixed.
+        let wanted = |name: &str| columns.is_none_or(|wanted| wanted.contains(name));
         let projected: Vec<String> = EVENT_COLUMNS
             .iter()
-            .map(|name| match columns {
-                Some(wanted) if !wanted.contains(name) => format!("NULL AS {name}"),
-                _ => (*name).to_owned(),
+            .map(|name| match wanted(name) {
+                false => format!("NULL AS {name}"),
+                true => (*name).to_owned(),
             })
             .collect();
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT event_id, file_id, record_index, {projection}
-             FROM events
-             WHERE file_id = ? AND record_index >= ? AND record_index < ?{narrowing}
-             ORDER BY record_index",
-            projection = projected.join(", "),
-            narrowing = candidate.map_or("", |candidate| candidate.sql.as_str()),
-        ))?;
-        // File id and range bounds, then the candidate's values, which are
-        // the same for every chunk.
-        let mut binds = vec![Value::UInt(0), Value::UBigInt(0), Value::UBigInt(0)];
-        binds.extend(candidate.iter().flat_map(|c| c.params.iter().cloned()));
-        for file in files {
+        // As microseconds, the unit it is stored in; rebuilt per row below.
+        let time = if wanted("event_time") {
+            "epoch_us(event_time)"
+        } else {
+            "NULL"
+        };
+        // Per raw kind: the statement, then its binds — range bounds first,
+        // then the candidate's values, which are the same for every range.
+        let mut scans = Vec::with_capacity(2);
+        for rendered_raw in [false, true] {
+            let candidate = candidates.get(rendered_raw);
+            let stmt = self.conn.prepare(&format!(
+                "SELECT event_id, file_id, record_index, {time} AS event_time, {projection}
+                 FROM events
+                 WHERE event_id >= ? AND event_id < ?{narrowing}{order}",
+                projection = projected.join(", "),
+                narrowing = candidate.map_or("", |candidate| candidate.sql.as_str()),
+                order = if ordered { " ORDER BY event_id" } else { "" },
+            ))?;
+            let mut binds = vec![Value::UBigInt(0), Value::UBigInt(0)];
+            binds.extend(candidate.iter().flat_map(|c| c.params.iter().cloned()));
+            scans.push((stmt, binds));
+        }
+        for (from, to, rendered_raw) in ranges {
             if cancelled() {
                 return Err(StoreError::Cancelled);
             }
-            if !wants(&file.log_type) {
-                continue;
-            }
-            binds[0] = Value::UInt(file.file_id);
-            let mut from = 0u64;
-            // Bounded by the file's own last record index: how many rows a
-            // chunk returned says nothing about whether the file is done.
-            // A narrowed chunk holds only candidates, and even an unfiltered
-            // one is short wherever a record failed to normalize and left a
-            // hole in `record_index`.
-            while from < file.end {
-                if cancelled() {
-                    return Err(StoreError::Cancelled);
-                }
-                binds[1] = Value::UBigInt(from);
-                binds[2] = Value::UBigInt(from + CHUNK);
-                let mut rows = stmt.query(duckdb::params_from_iter(binds.iter()))?;
-                while let Some(row) = rows.next()? {
-                    // Per row, before the columns are read: a chunk holds
-                    // 50,000 of them and an abandoned run must stop here,
-                    // not at the end of the file.
+            let (stmt, binds) = &mut scans[usize::from(rendered_raw)];
+            binds[0] = Value::UBigInt(from);
+            binds[1] = Value::UBigInt(to);
+            // Executes lazily; chunks are pulled through `step` below, which
+            // reports fetch errors where the iterator would panic.
+            drop(stmt.stream_arrow(duckdb::params_from_iter(binds.iter()))?);
+            while let Some(batch) = stmt.step()? {
+                let column = |index: usize| batch.column(index);
+                let ids = column(0).as_primitive::<UInt64Type>();
+                let file_ids = column(1).as_primitive::<UInt32Type>();
+                let indexes = column(2).as_primitive::<UInt64Type>();
+                let times = column(3);
+                let text = |index: usize, row: usize| arrow_text(column(4 + index), row);
+                let flag = |index: usize, row: usize| arrow_bool(column(4 + index), row);
+                for row in 0..batch.len() {
+                    // Per row, before the columns are read: an abandoned run
+                    // must stop here, not at the end of the range.
                     if cancelled() {
                         return Err(StoreError::Cancelled);
                     }
-                    let event_id: u64 = row.get(0)?;
+                    let file_id = file_ids.value(row);
+                    // A range spans the ids between its files; events of a
+                    // file `files` does not hold are not part of the case.
+                    let Ok(at) = files.binary_search_by_key(&file_id, |file| file.file_id) else {
+                        continue;
+                    };
+                    let log_type = files[at].log_type.as_str();
                     visit(
-                        event_id,
-                        &file.log_type,
+                        ids.value(row),
+                        log_type,
                         NormalizedEvent {
-                            file_id: row.get(1)?,
-                            record_index: row.get(2)?,
-                            // Time is not needed for rule evaluation yet; skip the parse.
-                            event_time: None,
-                            event_source: row.get(3)?,
-                            event_name: row.get(4)?,
-                            aws_region: row.get(5)?,
-                            account_id: row.get(6)?,
-                            source_ip: row.get(7)?,
-                            user_agent: row.get(8)?,
-                            identity_type: row.get(9)?,
-                            identity_arn: row.get(10)?,
-                            identity_name: row.get(11)?,
-                            mfa_authenticated: row.get(12)?,
-                            error_code: row.get(13)?,
-                            error_message: row.get(14)?,
-                            read_only: row.get(15)?,
-                            management_event: row.get(16)?,
-                            request: row.get(17)?,
-                            response: row.get(18)?,
-                            resources: row.get(19)?,
-                            raw: row.get(20)?,
+                            file_id,
+                            record_index: indexes.value(row),
+                            // Rules read the time (`event_time exists`/`missing`,
+                            // text operators); a scan that left it out would
+                            // contradict the candidate filter's `IS NULL`.
+                            event_time: arrow_time(times, row)?,
+                            event_source: text(0, row)?,
+                            event_name: text(1, row)?,
+                            aws_region: text(2, row)?,
+                            account_id: text(3, row)?,
+                            source_ip: text(4, row)?,
+                            user_agent: text(5, row)?,
+                            identity_type: text(6, row)?,
+                            identity_arn: text(7, row)?,
+                            identity_name: text(8, row)?,
+                            mfa_authenticated: flag(9, row)?,
+                            error_code: text(10, row)?,
+                            error_message: text(11, row)?,
+                            read_only: flag(12, row)?,
+                            management_event: flag(13, row)?,
+                            request: text(14, row)?,
+                            response: text(15, row)?,
+                            resources: text(16, row)?,
+                            raw: text(17, row)?,
                         },
                     );
                 }
-                from += CHUNK;
             }
         }
         // A scan that read nothing — no files, or none of the wanted type —
@@ -911,60 +998,59 @@ impl Store {
 
     /// Appends one batch of rule hits with each event's summary. Called
     /// repeatedly while streaming so matches never accumulate in memory
-    /// (NFR-2). The summary is fetched here rather than carried by the
-    /// scan: the scan reads only the columns the rule names, and the hits
-    /// are a small fraction of what it reads.
+    /// (NFR-2). The summary is read here rather than carried by the scan:
+    /// the scan reads only the columns the rule names, and the hits are a
+    /// small fraction of what it reads.
+    ///
+    /// The batch goes to a temporary table and joins `events` in one
+    /// statement. Looking each event up by id instead decoded a compressed
+    /// vector per hit: 10,000 hits spread over a case took ~1.9 s, the join
+    /// ~60 ms.
     pub fn append_match_batch(
         &mut self,
         batch: &[(String, crate::rule::Hit)],
     ) -> Result<(), StoreError> {
-        let ids: Vec<u64> = batch.iter().map(|(_, hit)| hit.event_id).collect();
-        let types = self.file_log_types()?;
-        let summaries = self.event_summaries(&ids, &types)?;
-        let mut appender = self.conn.appender("rule_matches")?;
-        for (rule_id, hit) in batch {
-            let fields =
-                serde_json::to_string(&hit.matched_fields).unwrap_or_else(|_| "{}".to_string());
-            // A hit for an unknown event keeps its evidence; the summary is
-            // simply empty. The type comes from the file either way.
-            let (time, row) = summaries
-                .get(&hit.event_id)
-                .map(|s| (s.time_micros, Some(&s.row)))
-                .unwrap_or((None, None));
-            let text = |pick: fn(&crate::results::MatchRow) -> &Option<String>| {
-                row.and_then(|r| pick(r).clone())
-            };
-            appender.append_row(params![
-                self.next_match_id,
-                rule_id,
-                hit.event_id,
-                fields,
-                types
-                    .get(&((hit.event_id >> 32) as u32))
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-                time.map_or(Value::Null, |us| Value::Timestamp(
-                    TimeUnit::Microsecond,
-                    us
-                )),
-                text(|r| &r.event_name),
-                text(|r| &r.event_source),
-                text(|r| &r.identity_arn),
-                text(|r| &r.source_ip),
-                text(|r| &r.user_agent),
-                text(|r| &r.aws_region),
-                text(|r| &r.error_code),
-                text(|r| &r.url),
-                text(|r| &r.status),
-                text(|r| &r.target),
-                text(|r| &r.resource),
-                text(|r| &r.country),
-                text(|r| &r.rule),
-                text(|r| &r.method),
-            ])?;
-            self.next_match_id += 1;
+        let Some(first) = batch.iter().map(|(_, hit)| hit.event_id).min() else {
+            return Ok(());
+        };
+        let last = batch
+            .iter()
+            .map(|(_, hit)| hit.event_id)
+            .max()
+            .unwrap_or(first);
+        self.conn.execute_batch(
+            "CREATE OR REPLACE TEMP TABLE match_batch
+                 (seq UBIGINT, rule_id VARCHAR, event_id UBIGINT, matched_fields VARCHAR)",
+        )?;
+        {
+            let mut appender =
+                self.conn
+                    .appender_to_catalog_and_db("match_batch", "temp", "main")?;
+            for (seq, (rule_id, hit)) in batch.iter().enumerate() {
+                let fields =
+                    serde_json::to_string(&hit.matched_fields).unwrap_or_else(|_| "{}".to_string());
+                appender.append_row(params![seq as u64, rule_id, hit.event_id, fields])?;
+            }
+            appender.flush()?;
         }
-        appender.flush()?;
+        // A hit for an unknown event keeps its evidence; the summary is
+        // simply empty. The type comes from the file either way.
+        self.conn.execute(
+            concat!(
+                "INSERT INTO rule_matches (match_id, rule_id, event_id, matched_fields, log_type,
+                     event_time, event_name, event_source, identity_arn, source_ip, url, status,
+                     target, user_agent, aws_region, error_code, resource, country, rule, method)
+                 SELECT ? + h.seq, h.rule_id, h.event_id, h.matched_fields,
+                     coalesce(f.log_type, ''), e.event_time, ",
+                summary_text_columns!(),
+                " FROM temp.match_batch h
+                 LEFT JOIN events e ON e.event_id = h.event_id AND e.event_id BETWEEN ? AND ?
+                 LEFT JOIN files f ON f.file_id = (h.event_id >> 32)"
+            ),
+            params![self.next_match_id, first, last],
+        )?;
+        self.conn.execute_batch("DROP TABLE temp.match_batch")?;
+        self.next_match_id += batch.len() as u64;
         Ok(())
     }
 
@@ -1016,11 +1102,14 @@ impl Store {
         Ok(groups)
     }
 
-    /// Events matched by at least one rule, inside the window's scope.
+    /// Events matched by at least one rule, inside the window's scope. A
+    /// condition search's hits are not a rule's.
     pub fn matched_event_count(&self, window: &crate::results::Window) -> Result<u64, StoreError> {
         let sql = format!(
-            "SELECT count(DISTINCT e.event_id) FROM rule_matches e WHERE true {}",
-            Self::scope_filter(window, MATCH_TYPE_FILTER)
+            "SELECT count(DISTINCT e.event_id) FROM rule_matches e
+             WHERE e.rule_id <> '{search}' {scope}",
+            search = crate::results::SEARCH_RULE_ID,
+            scope = Self::scope_filter(window, MATCH_TYPE_FILTER)
         );
         Ok(self.conn.query_row(
             &sql,
@@ -1255,7 +1344,7 @@ impl Store {
             event_id: id.to_string(),
             time_micros: last_time.map(|us| us.to_string()),
         });
-        let mut summaries = self.event_summaries(&ids, &self.file_log_types()?)?;
+        let mut summaries = self.event_summaries(&ids, &self.file_log_types(&ids)?)?;
         // Back in sort order: the lookup returns them keyed, not ordered.
         let rows = ids
             .iter()
@@ -1357,8 +1446,24 @@ impl Store {
         })
     }
 
-    fn file_log_types(&self) -> Result<HashMap<u32, String>, StoreError> {
-        let mut stmt = self.conn.prepare("SELECT file_id, log_type FROM files")?;
+    /// Log types of the files `event_ids` came from, and of no others: a
+    /// corpus registers millions of files, and loading them all cost every
+    /// results page a full read of `files`.
+    fn file_log_types(&self, event_ids: &[u64]) -> Result<HashMap<u32, String>, StoreError> {
+        let files: BTreeSet<u64> = event_ids.iter().map(|id| id >> 32).collect();
+        if files.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Integers we computed, never user text: safe to inline, and an
+        // inlined list reaches the primary key index.
+        let list = files
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT file_id, log_type FROM files WHERE file_id IN ({list})"
+        ))?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1440,7 +1545,7 @@ impl Store {
         params.extend(Self::search_params(&window.search));
         let continuation = Self::page_filter(window, &mut params);
         let sql = format!(
-            "SELECT {MATCH_SUMMARY_COLUMNS}, e.matched_fields FROM rule_matches e
+            "SELECT {MATCH_SUMMARY_COLUMNS}, e.matched_fields, e.log_type FROM rule_matches e
              WHERE e.rule_id = ? {type_filter} {filter} {continuation}
              {order}
              LIMIT ?",
@@ -1449,13 +1554,15 @@ impl Store {
             order = Self::order_by(window.newest_first),
         );
         params.push(Value::UBigInt(window.page_limit()));
-        let types = self.file_log_types()?;
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(duckdb::params_from_iter(params))?;
         let mut out = Vec::new();
         let mut last_time = None;
+        // The match row carries its type, so no file lookup.
+        let no_files = HashMap::new();
         while let Some(row) = rows.next()? {
-            let summary = Self::read_summary(row, &types, row.get(17)?)?;
+            let mut summary = Self::read_summary(row, &no_files, row.get(17)?)?;
+            summary.row.log_type = row.get(18)?;
             last_time = summary.time_micros;
             out.push(summary.row);
         }
@@ -1489,6 +1596,71 @@ impl Store {
         Ok(self
             .conn
             .query_row(&sql, duckdb::params_from_iter(params), |r| r.get(0))?)
+    }
+
+    /// How many rows of the list the window shows hold each value of
+    /// `field` (see `stats_expression`). `rule_id` is the list being
+    /// looked at: one rule's (or a condition search's) matches, or every
+    /// event. The window's log type, date range and text search narrow it
+    /// exactly as they narrow the list; paging does not.
+    pub fn field_stats(
+        &self,
+        rule_id: Option<&str>,
+        field: &str,
+        window: &crate::results::Window,
+    ) -> Result<crate::results::FieldStats, StoreError> {
+        let unknown = || StoreError::UnknownField(field.to_owned());
+        let mut params = Vec::new();
+        let rows = match rule_id {
+            None => {
+                params.extend(Self::scope_params(window)?);
+                params.extend(Self::search_params(&window.search));
+                format!(
+                    "SELECT {expr} AS v FROM events e WHERE true {scope} {search}",
+                    expr = stats_expression(field, "e").ok_or_else(unknown)?,
+                    scope = Self::scope_filter(window, EVENT_TYPE_FILTER),
+                    search = Self::search_filter(&window.search),
+                )
+            }
+            // The match table holds the hits and what the window filters on;
+            // the field may be any event column, so the events are joined.
+            Some(rule_id) => {
+                params.push(Value::Text(rule_id.to_owned()));
+                params.extend(Self::scope_params(window)?);
+                params.extend(Self::search_params(&window.search));
+                format!(
+                    "SELECT {expr} AS v FROM events x
+                     WHERE x.event_id IN (SELECT e.event_id FROM rule_matches e
+                                          WHERE e.rule_id = ? {scope} {search})",
+                    expr = stats_expression(field, "x").ok_or_else(unknown)?,
+                    scope = Self::scope_filter(window, MATCH_TYPE_FILTER),
+                    search = Self::search_filter(&window.search),
+                )
+            }
+        };
+        let sql = format!(
+            "SELECT v, n, count(*) OVER ()::UBIGINT, (sum(n) OVER ())::UBIGINT
+             FROM (SELECT v, count(*)::UBIGINT AS n FROM ({rows}) GROUP BY v)
+             ORDER BY n DESC, v NULLS LAST
+             LIMIT {STATS_LIMIT}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut result = stmt.query(duckdb::params_from_iter(params))?;
+        let mut stats = crate::results::FieldStats {
+            field: field.to_owned(),
+            total: 0,
+            distinct: 0,
+            values: Vec::new(),
+        };
+        while let Some(row) = result.next()? {
+            stats.distinct = row.get(2)?;
+            stats.total = row.get(3)?;
+            stats.values.push(crate::results::FieldCount {
+                value: row.get(0)?,
+                count: row.get(1)?,
+            });
+        }
+        Ok(stats)
     }
 
     /// The original record for one event, or `None` if it was not kept.
@@ -1570,6 +1742,53 @@ impl Store {
     }
 }
 
+/// Values a field statistic lists: the head of the distribution. The total
+/// and the number of distinct values still cover all of them.
+const STATS_LIMIT: u64 = 200;
+
+/// The SQL for one statistics field over rows aliased `alias`, as text so
+/// every value groups the same way; `None` for a field it cannot name.
+/// Normalized columns by name; `day`/`hour` are KST like the list;
+/// `request.*`/`response.*`/`resources.*` are payload paths as
+/// `payload_keys` spells them (`resources.0.ARN`). Only plain path segments
+/// are accepted, since they are inlined into the query.
+fn stats_expression(field: &str, alias: &str) -> Option<String> {
+    let kst = format!("{alias}.event_time + INTERVAL 9 HOUR");
+    match field {
+        "day" => return Some(format!("strftime({kst}, '%Y-%m-%d')")),
+        "hour" => return Some(format!("strftime({kst}, '%Y-%m-%d %H:00')")),
+        _ => {}
+    }
+    if candidate::TEXT_COLUMNS.contains(&field) {
+        return Some(format!("{alias}.{field}"));
+    }
+    if candidate::FLAG_COLUMNS.contains(&field) {
+        return Some(format!("CAST({alias}.{field} AS VARCHAR)"));
+    }
+    let (column, path) = field.split_once('.')?;
+    if !["request", "response", "resources"].contains(&column) {
+        return None;
+    }
+    let mut json_path = String::from("$");
+    for key in path.split('.') {
+        let plain = !key.is_empty()
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !plain {
+            return None;
+        }
+        if key.bytes().all(|b| b.is_ascii_digit()) {
+            json_path.push_str(&format!("[{key}]"));
+        } else {
+            json_path.push_str(&format!(".\"{key}\""));
+        }
+    }
+    Some(format!(
+        "json_extract_string({alias}.{column}, '{json_path}')"
+    ))
+}
+
 /// The id range to read in one scan, for a batch long enough to be worth it
 /// and packed tightly enough that reading the gaps costs less than probing
 /// the index per id. Ids are `file_id << 32 | record_index`, so a batch
@@ -1583,129 +1802,117 @@ fn dense_range(ids: &[u64]) -> Option<(u64, u64)> {
     (last - first < 2 * ids.len() as u64).then_some((first, last))
 }
 
-/// Columns a candidate filter may test. Each is a `VARCHAR` the evaluator
-/// reads back as a plain string, so SQL equality and the evaluator's are
-/// the same relation, byte for byte. JSON bodies, booleans and timestamps
-/// are left out: there the two disagree (rendered numbers, string
-/// booleans, formatted times), and a filter that drops one row the rule
-/// would have matched is a wrong answer, not a slow one.
-const FILTERABLE_COLUMNS: [&str; 11] = [
-    "event_source",
-    "event_name",
-    "aws_region",
-    "account_id",
-    "source_ip",
-    "user_agent",
-    "identity_type",
-    "identity_arn",
-    "identity_name",
-    "error_code",
-    "error_message",
-];
-
-/// A necessary condition for a rule set: every event the set can match
-/// satisfies it, so the scan may skip the rest. The converse does not
-/// hold, which is why rows that pass are still evaluated in full.
-struct Candidate {
-    /// Ready to append to the scan's `WHERE`, leading ` AND` included.
-    sql: String,
-    params: Vec<Value>,
-}
-
-/// The filter for a whole set. An event matches the set when it matches one
-/// of its rules, so the rules' filters are OR-ed — and a single rule that
-/// yields none leaves the whole set unfiltered, since anything narrower
-/// would drop that rule's hits.
-fn set_candidate(rules: &[&Rule]) -> Option<Candidate> {
-    let mut sql = String::new();
-    let mut params = Vec::new();
-    for rule in rules {
-        let candidate = rule_candidate(rule)?;
-        if !sql.is_empty() {
-            sql.push_str(" OR ");
-        }
-        sql.push_str(&candidate.sql);
-        params.extend(candidate.params);
+/// `event_id` ranges covering the stored rows of the wanted files, each
+/// holding at most `chunk` rows and files of one `kind`. Consecutive wanted
+/// files of a kind share a range; an unwanted file with rows ends it, and a
+/// file larger than `chunk` is cut by `record_index`. Ranges end at each
+/// file's last stored index, never at how many rows a query returned: a
+/// filtered range holds only candidates, and holes in `record_index` make
+/// even an unfiltered one come back short.
+fn scan_ranges(
+    files: &[FileSpan],
+    chunk: u64,
+    mut wants: impl FnMut(&str) -> bool,
+    kind: impl Fn(&str) -> bool,
+) -> Vec<(u64, u64, bool)> {
+    /// The range being built.
+    struct Open {
+        first: u32,
+        last: u32,
+        rows: u64,
+        kind: bool,
     }
-    (!sql.is_empty()).then(|| Candidate {
-        sql: format!(" AND ({sql})"),
-        params,
-    })
-}
-
-/// One rule's filter, built from the field conditions its condition cannot
-/// hold without. A rule whose required conditions are all unsupported —
-/// regexes, negations, JSON paths — gets none.
-fn rule_candidate(rule: &Rule) -> Option<Candidate> {
-    let required = necessary_vars(&rule.condition);
-    let mut sql = String::new();
-    let mut params = Vec::new();
-    for field in &rule.fields {
-        // A variable declared twice is satisfied by either condition, so
-        // neither of them is required on its own.
-        let alone = rule.fields.iter().filter(|f| f.var == field.var).count() == 1;
-        if !alone || !required.contains(field.var.as_str()) {
+    let id = |file_id: u32, index: u64| (u64::from(file_id) << 32) | index;
+    let mut ranges = Vec::new();
+    let mut open: Option<Open> = None;
+    let close = |open: &mut Option<Open>, ranges: &mut Vec<(u64, u64, bool)>| {
+        if let Some(range) = open.take() {
+            ranges.push((
+                id(range.first, 0),
+                (u64::from(range.last) + 1) << 32,
+                range.kind,
+            ));
+        }
+    };
+    for file in files {
+        // Nothing stored: such a file neither joins nor breaks a range.
+        if file.end == 0 {
             continue;
         }
-        let Some((predicate, values)) = column_predicate(field) else {
+        if !wants(&file.log_type) {
+            close(&mut open, &mut ranges);
             continue;
-        };
-        if !sql.is_empty() {
-            sql.push_str(" AND ");
         }
-        sql.push_str(&predicate);
-        params.extend(values);
+        let file_kind = kind(&file.log_type);
+        if file.end > chunk {
+            close(&mut open, &mut ranges);
+            let mut from = 0;
+            while from < file.end {
+                let to = (from + chunk).min(file.end);
+                ranges.push((id(file.file_id, from), id(file.file_id, to), file_kind));
+                from = to;
+            }
+            continue;
+        }
+        match &mut open {
+            Some(range) if range.kind == file_kind && range.rows + file.rows <= chunk => {
+                range.last = file.file_id;
+                range.rows += file.rows;
+            }
+            _ => {
+                close(&mut open, &mut ranges);
+                open = Some(Open {
+                    first: file.file_id,
+                    last: file.file_id,
+                    rows: file.rows,
+                    kind: file_kind,
+                });
+            }
+        }
     }
-    (!sql.is_empty()).then(|| Candidate {
-        sql: format!("({sql})"),
-        params,
-    })
+    close(&mut open, &mut ranges);
+    ranges
 }
 
-/// The variables a condition cannot hold without. Conservative by
-/// construction: a form that does not require a variable contributes none,
-/// so the filter derived from these can only ever be weaker than the rule.
-fn necessary_vars(condition: &Condition) -> BTreeSet<&str> {
-    match condition {
-        Condition::Var(var) => BTreeSet::from([var.as_str()]),
-        Condition::And(a, b) => {
-            let mut vars = necessary_vars(a);
-            vars.extend(necessary_vars(b));
-            vars
+/// A text cell of a scan result. `None` is SQL NULL, and also the
+/// `NULL AS` placeholder of a column the scan did not read.
+fn arrow_text(column: &ArrayRef, row: usize) -> Result<Option<String>, StoreError> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    let text = match column.data_type() {
+        DataType::Null => return Ok(None),
+        DataType::Utf8 => column.as_string::<i32>().value(row),
+        DataType::LargeUtf8 => column.as_string::<i64>().value(row),
+        DataType::Utf8View => column.as_string_view().value(row),
+        // Reading such a column as absent would make rules silently miss.
+        other => return Err(StoreError::ColumnType(other.to_string())),
+    };
+    Ok(Some(text.to_owned()))
+}
+
+/// An `epoch_us(event_time)` cell back as the time the parser stored.
+fn arrow_time(column: &ArrayRef, row: usize) -> Result<Option<OffsetDateTime>, StoreError> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    match column.data_type() {
+        DataType::Null => Ok(None),
+        DataType::Int64 => {
+            let micros = column.as_primitive::<Int64Type>().value(row);
+            Ok(OffsetDateTime::from_unix_timestamp_nanos(i128::from(micros) * 1000).ok())
         }
-        // Either side may be the one that held, so only what both require.
-        Condition::Or(a, b) => necessary_vars(a)
-            .intersection(&necessary_vars(b))
-            .copied()
-            .collect(),
-        // A variable that must *not* hold says nothing about the rows that
-        // do match, and neither does anything under the negation.
-        Condition::Not(_) => BTreeSet::new(),
-        // `N of (...)` pins a particular variable only when it needs them all.
-        Condition::NOf(count, vars) if *count >= vars.len() => {
-            vars.iter().map(String::as_str).collect()
-        }
-        Condition::NOf(..) => BTreeSet::new(),
+        other => Err(StoreError::ColumnType(other.to_string())),
     }
 }
 
-/// One field condition as SQL, where the database and the evaluator decide
-/// it the same way: `==` and `in` over a stored text column. Case-folding,
-/// substrings, regexes, numeric order, `exists`/`missing` and dotted JSON
-/// paths are left to the evaluator.
-fn column_predicate(field: &FieldCondition) -> Option<(String, Vec<Value>)> {
-    let column = FILTERABLE_COLUMNS
-        .iter()
-        .find(|name| **name == field.field)?;
-    match (field.op, &field.value) {
-        (Op::Eq, Literal::Str(text)) => {
-            Some((format!("{column} = ?"), vec![Value::Text(text.clone())]))
-        }
-        // An empty set matches nothing; `IN ()` is not SQL, so leave it.
-        (Op::In, Literal::Set(items)) if !items.is_empty() => Some((
-            format!("{column} IN ({})", vec!["?"; items.len()].join(", ")),
-            items.iter().cloned().map(Value::Text).collect(),
-        )),
-        _ => None,
+fn arrow_bool(column: &ArrayRef, row: usize) -> Result<Option<bool>, StoreError> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    match column.data_type() {
+        DataType::Null => Ok(None),
+        DataType::Boolean => Ok(Some(column.as_boolean().value(row))),
+        other => Err(StoreError::ColumnType(other.to_string())),
     }
 }

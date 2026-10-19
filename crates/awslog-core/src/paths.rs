@@ -1,5 +1,5 @@
 //! Portable case-root resolution. Everything the app writes lives under
-//! `<base>/cases/`; never AppData or other per-user system directories.
+//! `<base>/aws-log-analysis-cases/`; never AppData or other per-user system directories.
 //! See docs/07-case-layout.md.
 
 use std::fs;
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use time::PrimitiveDateTime;
 
-const CASES_DIR: &str = "cases";
+const CASES_DIR: &str = "aws-log-analysis-cases";
 
 /// Candidate roots, highest priority first.
 #[derive(Debug, Clone, Copy)]
@@ -37,8 +37,9 @@ pub enum PathError {
     },
 }
 
-/// Applies the documented priority: env var, then CLI flag, then `cases/`
-/// beside the executable. Pure: performs no filesystem access.
+/// Applies the documented priority: env var, then CLI flag, then
+/// `aws-log-analysis-cases/` beside the executable. Pure: performs no
+/// filesystem access.
 pub fn resolve(sources: &RootSources<'_>) -> PathBuf {
     if let Some(dir) = sources.env_dir {
         return dir.to_path_buf();

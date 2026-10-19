@@ -60,7 +60,7 @@ rule cloudtrail_console_login_failure
 
 내장 룰 18개로 시작한다. CloudTrail 11개(루트 콘솔 로그인, 로그인 실패, MFA 없는 로그인, 권한 오류 반복, CloudTrail 로깅 중지, 긴 AssumeRole 세션, 루트 API 사용, IAM 정책 변경, 액세스 키 생성, KMS 키 비활성화, GuardDuty·Security Hub 비활성화), ALB 3개(5xx, 403, 프록시성 메서드), WAF 2개(차단, SQLi/XSS 룰셋 차단), API Gateway·nginx 5xx.
 
-기본 룰 팩은 exe 안에 들어 있다. 어느 룰이든 원문을 열어 고쳐 저장하면 `cases/rules/` 의 사용자 룰이 되어 기본 룰을 덮고, 삭제하면 그 케이스에서만 빠진다. 룰은 파싱 때 평가하지 않는다 — 결과 화면에서 처음 고를 때 그 룰만 돌리므로, 3천만 건 케이스에서도 룰 하나가 20초 안팎이다.
+기본 룰 팩은 exe 안에 들어 있다. 어느 룰이든 원문을 열어 고쳐 저장하면 `aws-log-analysis-cases/rules/` 의 사용자 룰이 되어 기본 룰을 덮고, 삭제하면 그 케이스에서만 빠진다. 룰은 파싱 때 평가하지 않는다 — 결과 화면에서 처음 고를 때 그 룰만 돌리므로, 3천만 건 케이스에서도 룰 하나가 20초 안팎이다.
 
 ## 결과를 다루는 방법
 
@@ -80,6 +80,6 @@ rule cloudtrail_console_login_failure
 
 Windows 10 20H2 이상 / Windows 11 x64. 화면 표시에 쓰는 Edge WebView2 런타임은 해당 버전에 기본 포함되어 있고, Visual C++ 재배포 패키지는 필요 없다(CRT 정적 링크).
 
-결과는 실행 파일 옆 `cases/` 에만 쌓인다. 케이스 하나가 폴더 하나(`session.duckdb` + 파싱 시점의 룰 스냅샷 + 로그)이며, 폴더째 복사하면 다른 PC 에서 그대로 열린다. AppData·레지스트리·시스템 temp 에는 아무것도 남기지 않으며, 네트워크로 나가는 것도 없다.
+결과는 실행 파일 옆 `aws-log-analysis-cases/` 에만 쌓인다. 케이스 하나가 폴더 하나(`session.duckdb` + 파싱 시점의 룰 스냅샷 + 로그)이며, 폴더째 복사하면 다른 PC 에서 그대로 열린다. AppData·레지스트리·시스템 temp 에는 아무것도 남기지 않으며, 네트워크로 나가는 것도 없다.
 
 파싱은 파일 4개를 병렬로 스트리밍하고 메모리 사용량을 입력 크기와 무관하게 유지한다. 3.0 GB(2,572파일, 3,125만 건) ALB 로그 기준 약 6분, 최대 RSS 2.5 GB.
