@@ -6,6 +6,7 @@ pub mod logging;
 pub mod mapping;
 pub mod model;
 pub mod ndjson;
+mod parquet;
 pub mod parse;
 pub mod paths;
 pub mod payload;

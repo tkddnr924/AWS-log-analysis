@@ -252,7 +252,8 @@ pub fn run(
                             ),
                             log_type @ (LogType::WafAcl
                             | LogType::ApigwAccess
-                            | LogType::NginxAccess) => parse_line_file(
+                            | LogType::NginxAccess
+                            | LogType::GatewayRequest) => parse_line_file(
                                 &job.path,
                                 options,
                                 &mut sink,
@@ -268,6 +269,11 @@ pub fn run(
                                     )
                                 },
                             ),
+                            // Detection never classifies Parquet rows as
+                            // CloudTrail, and the CloudTrail reader is gzip-only.
+                            LogType::Unknown if crate::parquet::is_parquet(&job.path) => {
+                                Ok(ParsedFile::default())
+                            }
                             LogType::CloudTrail | LogType::Unknown => parse_cloudtrail_file(
                                 &job.path,
                                 job.file_id,
@@ -442,9 +448,9 @@ fn parse_cloudtrail_file(
     }
 }
 
-/// Streams one line-per-record file (ALB text, NDJSON). `normalize` turns a
-/// line into an event or `Err(())` for a malformed one, which is counted and
-/// skipped; a file with no valid record at all fails.
+/// Streams one line-per-record file (ALB text, NDJSON, Parquet rows as JSON).
+/// `normalize` turns a line into an event or `Err(())` for a malformed one,
+/// which is counted and skipped; a file with no valid record at all fails.
 ///
 /// Inflate and the appender are serial per file, but normalizing a batch of
 /// lines fans out over the worker pool while `spare_threads` says some are
@@ -459,9 +465,46 @@ fn parse_line_file(
     spare_threads: &(dyn Fn() -> bool + Sync),
     normalize: impl Fn(&str, &mut Vec<Range<usize>>, u64) -> Result<NormalizedEvent, ()> + Sync,
 ) -> Result<ParsedFile, String> {
+    if crate::parquet::is_parquet(path) {
+        return crate::parquet::with_rows(path, |rows| {
+            parse_lines(
+                |line| rows.read_into(line),
+                options,
+                sink,
+                kind,
+                spare_threads,
+                normalize,
+            )
+        })?;
+    }
     let file = File::open(path).map_err(|error| format!("cannot open: {error}"))?;
     let decoder = MultiGzDecoder::new(BufReader::new(file));
     let mut reader = BufReader::new(decoder);
+    parse_lines(
+        |line| {
+            reader
+                .read_line(line)
+                .map(|bytes| bytes > 0)
+                .map_err(|error| crate::logging::redact(&format!("gzip read failed: {error}")))
+        },
+        options,
+        sink,
+        kind,
+        spare_threads,
+        normalize,
+    )
+}
+
+/// The batch loop behind [`parse_line_file`]. `next_line` appends one line
+/// to its (cleared) buffer and returns `false` at the end of input.
+fn parse_lines(
+    mut next_line: impl FnMut(&mut String) -> Result<bool, String>,
+    options: &ParseOptions,
+    sink: &mut BatchSink<'_, '_>,
+    kind: &str,
+    spare_threads: &(dyn Fn() -> bool + Sync),
+    normalize: impl Fn(&str, &mut Vec<Range<usize>>, u64) -> Result<NormalizedEvent, ()> + Sync,
+) -> Result<ParsedFile, String> {
     // Line buffers are reused across batches; `filled` bounds the live ones.
     let mut lines: Vec<String> = Vec::new();
     let mut batch = Vec::with_capacity(options.batch_size.min(4096));
@@ -477,10 +520,7 @@ fn parse_line_file(
             }
             let line = &mut lines[filled];
             line.clear();
-            let bytes = reader
-                .read_line(line)
-                .map_err(|error| crate::logging::redact(&format!("gzip read failed: {error}")))?;
-            if bytes == 0 {
+            if !next_line(line)? {
                 eof = true;
                 break;
             }

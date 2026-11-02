@@ -78,7 +78,7 @@ pub fn preview_head(
     let text = String::from_utf8_lossy(&head);
     match log_type {
         LogType::CloudTrail => Ok(cloudtrail(&text, map)),
-        LogType::WafAcl | LogType::ApigwAccess | LogType::NginxAccess => {
+        LogType::WafAcl | LogType::ApigwAccess | LogType::NginxAccess | LogType::GatewayRequest => {
             Ok(ndjson(&text, log_type))
         }
         LogType::AlbAccess => Ok(alb(&text)),
@@ -339,6 +339,17 @@ fn ndjson_labels(log_type: LogType) -> &'static [(&'static str, &'static str)] {
             ("_source.service.name", "resources.service"),
             ("_source.service.environment", "resources.environment"),
             ("_source.trace.id", "request.trace_id"),
+        ],
+        LogType::GatewayRequest => &[
+            ("requestedtimeutc", "event_time"),
+            ("httpmethod", "event_name"),
+            ("sourceip", "source_ip"),
+            ("memberid", "identity_name"),
+            ("apipath", "request.url"),
+            ("apiparams", "request.params"),
+            ("requestheaders", "request.headers"),
+            ("requestbody", "request.body"),
+            ("datadogtraceid", "request.trace_id"),
         ],
         _ => &[],
     }

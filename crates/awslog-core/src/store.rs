@@ -116,6 +116,8 @@ pub enum StoreError {
     ColumnType(String),
     #[error("통계를 낼 수 없는 필드입니다: {0}")]
     UnknownField(String),
+    #[error("내보내기 파일을 쓸 수 없습니다: {0}")]
+    ExportWrite(#[source] std::io::Error),
     // A run the user walked away from. Not a failure: the work is simply
     // not recorded, and the next attempt starts over.
     #[error("작업이 취소되었습니다")]
@@ -1598,6 +1600,146 @@ impl Store {
             .query_row(&sql, duckdb::params_from_iter(params), |r| r.get(0))?)
     }
 
+    /// Writes the whole list the window shows — every event, or `rule_id`'s
+    /// matches — to `path` as JSON lines, in the list's order. Paging is
+    /// ignored: the export is every row, not the loaded ones. Returns the
+    /// rows written.
+    ///
+    /// Only the narrow sort keys are ordered, streamed chunk by chunk; each
+    /// chunk's full rows are then fetched by primary key and written. One
+    /// `COPY (… ORDER BY …)` sorted the wide rows (raw JSON included) and ran
+    /// out of the 1 GiB memory limit on a 2M-row case even with spilling.
+    /// The file appears only once complete: rows go to a fresh temp file
+    /// beside `path` (`create_export_temp`), renamed on success and removed
+    /// on any failure, the rename included.
+    pub fn export_jsonl(
+        &self,
+        rule_id: Option<&str>,
+        window: &crate::results::Window,
+        path: &Path,
+    ) -> Result<u64, StoreError> {
+        use duckdb::arrow::array::{Array, AsArray};
+        use duckdb::arrow::datatypes::UInt64Type;
+        use std::io::Write;
+
+        let mut params = Vec::new();
+        let keys = match rule_id {
+            None => {
+                params.extend(Self::scope_params(window)?);
+                params.extend(Self::search_params(&window.search));
+                format!(
+                    "SELECT e.event_id FROM events e WHERE true {scope} {search} {order}",
+                    scope = Self::scope_filter(window, EVENT_TYPE_FILTER),
+                    search = Self::search_filter(&window.search),
+                    order = Self::order_by(window.newest_first),
+                )
+            }
+            Some(rule_id) => {
+                params.push(Value::Text(rule_id.to_owned()));
+                params.extend(Self::scope_params(window)?);
+                params.extend(Self::search_params(&window.search));
+                format!(
+                    "SELECT e.event_id, e.matched_fields::VARCHAR FROM rule_matches e
+                     WHERE e.rule_id = ? {scope} {search} {order}",
+                    scope = Self::scope_filter(window, MATCH_TYPE_FILTER),
+                    search = Self::search_filter(&window.search),
+                    order = Self::order_by(window.newest_first),
+                )
+            }
+        };
+        // The key stream stays open on `self.conn`; a query on the same
+        // connection would end it, so rows are fetched through a clone.
+        let lookup = self.conn.try_clone()?;
+        // Each line is `{"rule_id":…,"matched_fields":…,` + this object
+        // minus its `{` for a rule, or this object as is.
+        let rule_prefix = rule_id
+            .map(|id| serde_json::to_string(id).expect("a string serializes"))
+            .map(|id| format!("{{\"rule_id\":{id},\"matched_fields\":"));
+
+        let (partial, file) = create_export_temp(path).map_err(StoreError::ExportWrite)?;
+        let mut out = std::io::BufWriter::new(file);
+        let mut written = 0u64;
+        let result = (|| -> Result<(), StoreError> {
+            let mut stmt = self.conn.prepare(&keys)?;
+            // Executes in streaming mode; its iterator panics on a fetch
+            // error, so chunks are pulled through `step` instead.
+            drop(stmt.stream_arrow(duckdb::params_from_iter(params))?);
+            let mut rows: HashMap<u64, String> = HashMap::new();
+            while let Some(chunk) = stmt.step()? {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let ids = chunk.column(0).as_primitive::<UInt64Type>();
+                let evidence = chunk.columns().get(1);
+                // Ids are integers we computed, never user text: safe to
+                // inline, and an inlined list reaches the primary key index.
+                let list = ids
+                    .values()
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                rows.clear();
+                let mut fetch = lookup.prepare(&format!(
+                    "SELECT event_id, to_json(t)::VARCHAR FROM (
+                         SELECT x.event_id, f.log_type, f.path AS file,
+                                strftime(x.event_time + INTERVAL 9 HOUR, '%Y-%m-%d %H:%M:%S.%g')
+                                    AS event_time_kst,
+                                x.event_source, x.event_name, x.aws_region, x.account_id,
+                                x.source_ip, x.user_agent, x.identity_type, x.identity_arn,
+                                x.identity_name, x.mfa_authenticated, x.error_code,
+                                x.error_message, x.read_only, x.management_event,
+                                x.request, x.response, x.resources, x.raw
+                         FROM events x JOIN files f ON f.file_id = x.file_id
+                         WHERE x.event_id IN ({list})) t"
+                ))?;
+                let mut found = fetch.query([])?;
+                while let Some(row) = found.next()? {
+                    rows.insert(row.get(0)?, row.get(1)?);
+                }
+                // Back in key order: the lookup returns them keyed, not ordered.
+                for (index, id) in ids.values().iter().enumerate() {
+                    let Some(line) = rows.get(id) else { continue };
+                    let write = |out: &mut std::io::BufWriter<std::fs::File>| match (
+                        &rule_prefix,
+                        evidence,
+                    ) {
+                        (Some(prefix), Some(column)) => {
+                            let fields =
+                                crate::parquet::arrow_text(column.as_ref(), index).unwrap_or("{}");
+                            out.write_all(prefix.as_bytes())?;
+                            out.write_all(fields.as_bytes())?;
+                            out.write_all(b",")?;
+                            out.write_all(&line.as_bytes()[1..])?;
+                            out.write_all(b"\n")
+                        }
+                        _ => {
+                            out.write_all(line.as_bytes())?;
+                            out.write_all(b"\n")
+                        }
+                    };
+                    write(&mut out).map_err(StoreError::ExportWrite)?;
+                    written += 1;
+                }
+            }
+            out.flush().map_err(StoreError::ExportWrite)
+        })();
+        drop(out);
+        match result {
+            Ok(()) => match std::fs::rename(&partial, path) {
+                Ok(()) => Ok(written),
+                Err(error) => {
+                    let _ = std::fs::remove_file(&partial);
+                    Err(StoreError::ExportWrite(error))
+                }
+            },
+            Err(error) => {
+                let _ = std::fs::remove_file(&partial);
+                Err(error)
+            }
+        }
+    }
+
     /// How many rows of the list the window shows hold each value of
     /// `field` (see `stats_expression`). `rule_id` is the list being
     /// looked at: one rule's (or a condition search's) matches, or every
@@ -1739,6 +1881,43 @@ impl Store {
             status: CaseStatus::parse(&status),
             app_version: row.get(3)?,
         })
+    }
+}
+
+/// A new, uniquely named file beside `target` for an export in progress.
+/// `create_new` never opens an existing file, so nothing the user did not
+/// choose is truncated; a name that is taken is skipped. Same directory, so
+/// the final rename stays on one filesystem.
+fn create_export_temp(target: &Path) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let dir = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "export".to_owned());
+    let mut attempts = 0;
+    loop {
+        let candidate = dir.join(format!(
+            ".{name}.{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 100 => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 

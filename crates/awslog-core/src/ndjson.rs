@@ -1,12 +1,14 @@
-//! Line-delimited JSON logs: WAF (wafv2), API Gateway access logs and nginx
-//! access logs exported from Elasticsearch/filebeat. One record per line,
-//! recognised by their keys and folded onto the normalized event columns.
+//! Line-delimited JSON logs: WAF (wafv2), API Gateway access logs, nginx
+//! access logs exported from Elasticsearch/filebeat, and API gateway request
+//! logs (Parquet rows arrive here as JSON lines, see `parquet.rs`). One
+//! record per line, recognised by their keys and folded onto the normalized
+//! event columns.
 
 use serde::Serialize;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
-use time::OffsetDateTime;
+use time::{OffsetDateTime, PrimitiveDateTime};
 
 use crate::detect::{LogType, SampleRecord};
 use crate::model::NormalizedEvent;
@@ -14,6 +16,12 @@ use crate::model::NormalizedEvent;
 /// Which producer wrote this record, judged by keys no other format shares.
 pub fn classify(value: &Value) -> Option<LogType> {
     let obj = value.as_object()?;
+    if obj.contains_key("requestedtimeutc")
+        && obj.contains_key("httpmethod")
+        && obj.contains_key("apipath")
+    {
+        return Some(LogType::GatewayRequest);
+    }
     if obj.contains_key("webaclId") && obj.contains_key("httpRequest") && obj.contains_key("action")
     {
         return Some(LogType::WafAcl);
@@ -38,6 +46,15 @@ pub fn classify(value: &Value) -> Option<LogType> {
 
 /// The head-of-file summary shown before parsing (FR-4).
 pub fn sample(log_type: LogType, value: &Value) -> SampleRecord {
+    let mut expanded;
+    let value = match log_type {
+        LogType::GatewayRequest => {
+            expanded = value.clone();
+            expand_headers(&mut expanded);
+            &expanded
+        }
+        _ => value,
+    };
     let fields = Fields::extract(log_type, value);
     SampleRecord {
         raw: Some(value.to_string()),
@@ -59,13 +76,21 @@ pub(crate) fn normalize(
     record_index: u64,
     keep_raw: bool,
 ) -> Result<NormalizedEvent, ()> {
-    let value: Value = serde_json::from_str(line).map_err(|_| ())?;
+    let mut value: Value = serde_json::from_str(line).map_err(|_| ())?;
+    if log_type == LogType::GatewayRequest {
+        expand_headers(&mut value);
+    }
     let f = Fields::extract(log_type, &value);
     let (request, response, resources) = match log_type {
         LogType::WafAcl => waf_json(&value, &f)?,
         LogType::ApigwAccess => apigw_json(&value, &f)?,
         LogType::NginxAccess => nginx_json(&value, &f)?,
+        LogType::GatewayRequest => gateway_json(&value, &f)?,
         _ => return Err(()),
+    };
+    let (identity_type, identity_name) = match log_type {
+        LogType::GatewayRequest => member(value.get("memberid")),
+        _ => (None, None),
     };
     let method_or_action = f.name.map(str::to_owned);
     Ok(NormalizedEvent {
@@ -78,9 +103,9 @@ pub(crate) fn normalize(
         account_id: f.account.map(str::to_owned),
         source_ip: f.source_ip.map(str::to_owned),
         user_agent: f.user_agent.map(str::to_owned),
-        identity_type: None,
+        identity_type: identity_type.map(str::to_owned),
         identity_arn: None,
-        identity_name: None,
+        identity_name,
         mfa_authenticated: None,
         error_code: f.error_code,
         error_message: None,
@@ -93,11 +118,40 @@ pub(crate) fn normalize(
     })
 }
 
+/// The gateway writes request headers as a JSON string column; parse it in
+/// place so headers are addressable as `request.headers.<name>`. A value
+/// that is not JSON stays a string.
+fn expand_headers(value: &mut Value) {
+    if let Some(slot) = value.get_mut("requestheaders") {
+        if let Some(parsed) = slot
+            .as_str()
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        {
+            *slot = parsed;
+        }
+    }
+}
+
+/// `memberid` 0 (or empty) is an anonymous caller, not member "0".
+fn member(id: Option<&Value>) -> (Option<&'static str>, Option<String>) {
+    let id = match id {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.trim().to_owned(),
+        _ => return (None, None),
+    };
+    if id.is_empty() || id == "0" {
+        (Some("anonymous"), None)
+    } else {
+        (Some("member"), Some(id))
+    }
+}
+
 fn source_of(log_type: LogType) -> &'static str {
     match log_type {
         LogType::WafAcl => "wafv2.amazonaws.com",
         LogType::ApigwAccess => "apigateway.amazonaws.com",
         LogType::NginxAccess => "nginx",
+        LogType::GatewayRequest => "api-gateway",
         other => other.as_str(),
     }
 }
@@ -193,6 +247,32 @@ impl<'a> Fields<'a> {
                     error_code: http_error(status),
                 }
             }
+            LogType::GatewayRequest => {
+                let method = v.get("httpmethod").and_then(Value::as_str);
+                Self {
+                    time: v
+                        .get("requestedtimeutc")
+                        .and_then(Value::as_str)
+                        .and_then(parse_utc_time),
+                    name: method,
+                    method,
+                    region: None,
+                    account: None,
+                    // An X-Forwarded-For chain; the first hop is the client.
+                    source_ip: v
+                        .get("sourceip")
+                        .and_then(Value::as_str)
+                        .and_then(|chain| chain.split(',').next())
+                        .map(str::trim)
+                        .filter(|ip| !ip.is_empty()),
+                    user_agent: v
+                        .get("requestheaders")
+                        .and_then(|h| h.get("user-agent"))
+                        .and_then(Value::as_str),
+                    status: None,
+                    error_code: None,
+                }
+            }
             _ => Self::default(),
         }
     }
@@ -227,6 +307,30 @@ fn parse_clf_time(text: &str) -> Option<OffsetDateTime> {
         ),
     )
     .ok()
+}
+
+/// RFC 3339, or the zone-less `2026-08-31 00:00:05.123` DuckDB renders for a
+/// TIMESTAMP column, read as UTC (the gateway's column is `…utc`).
+fn parse_utc_time(text: &str) -> Option<OffsetDateTime> {
+    if let Ok(time) = OffsetDateTime::parse(text, &Rfc3339) {
+        return Some(time);
+    }
+    if let Ok(time) = OffsetDateTime::parse(
+        text,
+        format_description!(
+            "[year]-[month]-[day][first [ ][T]][hour]:[minute]:[second][optional [.[subsecond]]][offset_hour sign:mandatory][optional [:[offset_minute]]]"
+        ),
+    ) {
+        return Some(time);
+    }
+    PrimitiveDateTime::parse(
+        text,
+        format_description!(
+            "[year]-[month]-[day][first [ ][T]][hour]:[minute]:[second][optional [.[subsecond]]]"
+        ),
+    )
+    .ok()
+    .map(PrimitiveDateTime::assume_utc)
 }
 
 #[derive(Serialize)]
@@ -306,6 +410,27 @@ fn apigw_json(v: &Value, f: &Fields) -> Result<(String, String, String), ()> {
         "api_id": s("api_id"),
         "stage": s("stage"),
         "resource_path": s("resource_path"),
+    })
+    .to_string();
+    Ok((request, response, resources))
+}
+
+fn gateway_json(v: &Value, f: &Fields) -> Result<(String, String, String), ()> {
+    let headers = v.get("requestheaders");
+    let request = serde_json::json!({
+        "method": f.method,
+        "url": v.get("apipath"),
+        "params": v.get("apiparams"),
+        "headers": headers,
+        "body": v.get("requestbody"),
+        "trace_id": v.get("datadogtraceid"),
+        "forwarded_for": v.get("sourceip"),
+    })
+    .to_string();
+    // The gateway log carries no response fields.
+    let response = "{}".to_owned();
+    let resources = serde_json::json!({
+        "host": headers.and_then(|h| h.get("host")),
     })
     .to_string();
     Ok((request, response, resources))

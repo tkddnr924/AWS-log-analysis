@@ -225,7 +225,7 @@ fn cases_root(state: tauri::State<'_, AppState>) -> String {
     state.cases_root.path().display().to_string()
 }
 
-/// FR-2: list supported gzip log candidates without reading their contents.
+/// FR-2: list supported gzip and Parquet log candidates without reading their contents.
 /// Async so Tauri runs it off the main thread — a bucket export can hold tens
 /// of thousands of files and the walk must not freeze the window (NFR-3).
 #[tauri::command]
@@ -745,6 +745,30 @@ async fn query_rule_matches(
     .map_err(|e| e.to_string())?
 }
 
+/// Writes the whole list on screen — every event (`rule_id` null) or one
+/// rule's / a condition search's matches, under the window's type, range,
+/// search and order — to `path` as JSON lines. Paging is ignored, so rows not
+/// loaded yet are included. `path` comes from the native save dialog.
+#[tauri::command]
+#[specta::specta]
+async fn export_results(
+    state: tauri::State<'_, AppState>,
+    case_id: String,
+    rule_id: Option<String>,
+    window: results::Window,
+    path: String,
+) -> Result<u32, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = state.store(&case_id)?;
+        results::export_jsonl(&store, rule_id.as_deref(), &window, Path::new(&path))
+            .map(|rows| rows as u32)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Per-value counts of one field over the list on screen: every event
 /// (`rule_id` null) or one rule's / a condition search's matches, under the
 /// window's log type, date range and text search.
@@ -1245,6 +1269,7 @@ pub fn run() {
             cancel_parse,
             query_results,
             query_rule_matches,
+            export_results,
             list_payload_keys,
             preview_head,
             get_raw_record,

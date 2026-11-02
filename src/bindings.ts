@@ -7,7 +7,7 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 export const commands = {
 	casesRoot: () => __TAURI_INVOKE<string>("cases_root"),
 	/**
-	 *  FR-2: list supported gzip log candidates without reading their contents.
+	 *  FR-2: list supported gzip and Parquet log candidates without reading their contents.
 	 *  Async so Tauri runs it off the main thread — a bucket export can hold tens
 	 *  of thousands of files and the walk must not freeze the window (NFR-3).
 	 */
@@ -37,6 +37,13 @@ export const commands = {
 	 *  The filtered count is computed only for the first page.
 	 */
 	queryRuleMatches: (caseId: string, ruleId: string, window: Window) => typedError<EventPage, string>(__TAURI_INVOKE("query_rule_matches", { caseId, ruleId, window })),
+	/**
+	 *  Writes the whole list on screen — every event (`rule_id` null) or one
+	 *  rule's / a condition search's matches, under the window's type, range,
+	 *  search and order — to `path` as JSON lines. Paging is ignored, so rows not
+	 *  loaded yet are included. `path` comes from the native save dialog.
+	 */
+	exportResults: (caseId: string, ruleId: string | null, window: Window, path: string) => typedError<number, string>(__TAURI_INVOKE("export_results", { caseId, ruleId, window, path })),
 	/**
 	 *  The payload paths a case's events hold (`request.*`, `response.*`,
 	 *  `resources.*`), counted while parsing, so the rule editor can offer what

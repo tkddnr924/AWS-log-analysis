@@ -2278,3 +2278,146 @@ fn field_stats_refuse_a_field_they_cannot_name() {
         );
     }
 }
+
+fn read_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn export_writes_every_event_of_the_list_not_just_the_loaded_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::create(&tmp.path().join("s.duckdb"), "c1", "/logs").unwrap();
+    store
+        .register_file(0, "a.json.gz", 1, "cloudtrail")
+        .unwrap();
+    // More than one page (the backend caps a page at 1000 rows); every third
+    // event is a different call so the search has something to drop.
+    let events: Vec<_> = (0..1500)
+        .map(|i| {
+            let mut e = event(
+                i,
+                if i % 3 == 0 {
+                    "GetCallerIdentity"
+                } else {
+                    "ConsoleLogin"
+                },
+            );
+            e.request = Some(format!(r#"{{"seq":{i}}}"#));
+            e
+        })
+        .collect();
+    store.append_events(&events).unwrap();
+    let out = tmp.path().join("all.jsonl");
+
+    let written = results::export_jsonl(
+        &store,
+        None,
+        &Window {
+            limit: 200,
+            search: "consolelogin".into(),
+            newest_first: true,
+            ..Default::default()
+        },
+        &out,
+    )
+    .unwrap();
+
+    let lines = read_jsonl(&out);
+    assert_eq!(written, 1000);
+    assert_eq!(
+        lines.len(),
+        1000,
+        "paging limit does not apply to an export"
+    );
+    assert!(lines.iter().all(|l| l["event_name"] == "ConsoleLogin"));
+    // Same order as the list: newest first, ties broken by id descending.
+    assert_eq!(
+        lines[0]["request"]["seq"], 1499,
+        "JSON columns stay objects"
+    );
+    assert_eq!(lines[1]["request"]["seq"], 1498);
+    assert_eq!(lines[0]["raw"]["seq"], 1499);
+    assert_eq!(lines[0]["log_type"], "cloudtrail");
+    assert_eq!(lines[0]["file"], "a.json.gz");
+    assert!(lines[0].get("rule_id").is_none());
+}
+
+#[test]
+fn export_of_a_rule_writes_its_matches_with_the_evidence() {
+    let (tmp, store, _set) = seeded(1200);
+    let out = tmp.path().join("rule.jsonl");
+
+    let written =
+        results::export_jsonl(&store, Some("root_login"), &Window::default(), &out).unwrap();
+
+    let lines = read_jsonl(&out);
+    assert_eq!(written, 1200);
+    assert_eq!(lines.len(), 1200);
+    assert_eq!(lines[0]["rule_id"], "root_login");
+    assert_eq!(lines[0]["matched_fields"]["$name"], "ConsoleLogin");
+    assert_eq!(lines[0]["identity_type"], "Root");
+
+    let none = tmp.path().join("none.jsonl");
+    let written = results::export_jsonl(
+        &store,
+        Some("root_login"),
+        &Window {
+            search: "no-such-text".into(),
+            ..Default::default()
+        },
+        &none,
+    )
+    .unwrap();
+    assert_eq!(written, 0);
+    assert!(read_jsonl(&none).is_empty());
+}
+
+#[test]
+fn export_never_touches_files_the_user_did_not_choose() {
+    let (tmp, store, _set) = seeded(3);
+    let dir = tmp.path().join("out");
+    std::fs::create_dir(&dir).unwrap();
+    // Names a naive temp file would take beside the target.
+    let bystander = dir.join("report.jsonl.part");
+    std::fs::write(&bystander, "keep me").unwrap();
+    let out = dir.join("report.jsonl");
+
+    let written = results::export_jsonl(&store, None, &Window::default(), &out).unwrap();
+
+    assert_eq!(written, 3);
+    assert_eq!(read_jsonl(&out).len(), 3);
+    assert_eq!(std::fs::read_to_string(&bystander).unwrap(), "keep me");
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["report.jsonl", "report.jsonl.part"],
+        "no temp file left"
+    );
+}
+
+#[test]
+fn a_failed_export_leaves_no_temp_file_behind() {
+    let (tmp, store, _set) = seeded(3);
+    let dir = tmp.path().join("out");
+    std::fs::create_dir(&dir).unwrap();
+    // A directory in the way: the final rename fails after the rows are written.
+    let out = dir.join("report.jsonl");
+    std::fs::create_dir(&out).unwrap();
+    std::fs::write(out.join("inside"), "x").unwrap();
+
+    assert!(results::export_jsonl(&store, None, &Window::default(), &out).is_err());
+
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["report.jsonl"]);
+}

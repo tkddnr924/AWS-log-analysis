@@ -36,6 +36,7 @@ pub enum LogType {
     WafAcl,
     ApigwAccess,
     NginxAccess,
+    GatewayRequest,
     CloudTrailDigest,
     ConfigSnapshot,
     Unknown,
@@ -49,6 +50,7 @@ impl LogType {
             Self::WafAcl => "waf_acl",
             Self::ApigwAccess => "apigw_access",
             Self::NginxAccess => "nginx_access",
+            Self::GatewayRequest => "gateway_request",
             Self::CloudTrailDigest => "cloudtrail_digest",
             Self::ConfigSnapshot => "config_snapshot",
             Self::Unknown => "unknown",
@@ -63,6 +65,7 @@ impl LogType {
             Self::WafAcl,
             Self::ApigwAccess,
             Self::NginxAccess,
+            Self::GatewayRequest,
             Self::CloudTrailDigest,
             Self::ConfigSnapshot,
             Self::Unknown,
@@ -128,8 +131,9 @@ impl Detection {
     }
 }
 
-/// The decoded head of a gzip file, up to [`HEAD_LIMIT`] bytes, and whether
+/// The decoded head of a log file, up to [`HEAD_LIMIT`] bytes, and whether
 /// the stream ended early (a cut-off member still leaves usable bytes).
+/// Gzip is inflated; Parquet rows come back as JSON lines (`parquet.rs`).
 /// Shared by detection and the pre-parse preview so both look at the same
 /// bytes.
 pub fn decoded_head(path: &Path) -> Result<(Vec<u8>, bool), DetectError> {
@@ -137,6 +141,11 @@ pub fn decoded_head(path: &Path) -> Result<(Vec<u8>, bool), DetectError> {
         path: path.to_path_buf(),
         source,
     };
+    if crate::parquet::is_parquet(path) {
+        return parquet_head(path)
+            .map(|head| (head, false))
+            .map_err(|note| io(std::io::Error::other(note)));
+    }
     let file = File::open(path).map_err(io)?;
     let mut decoder = MultiGzDecoder::new(BufReader::new(file));
     let mut head = Vec::with_capacity(HEAD_LIMIT.min(64 * 1024));
@@ -147,6 +156,52 @@ pub fn decoded_head(path: &Path) -> Result<(Vec<u8>, bool), DetectError> {
         Ok(_) => Ok((head, false)),
         Err(_) if !head.is_empty() => Ok((head, true)),
         Err(source) => Err(io(source)),
+    }
+}
+
+/// Whole rows as JSON lines until [`HEAD_LIMIT`] is reached.
+fn parquet_head(path: &Path) -> Result<Vec<u8>, String> {
+    crate::parquet::with_rows(path, |rows| {
+        let mut head = String::new();
+        while head.len() < HEAD_LIMIT {
+            if !head.is_empty() {
+                head.push('\n');
+            }
+            if !rows.read_into(&mut head)? {
+                break;
+            }
+        }
+        Ok(head.into_bytes())
+    })?
+}
+
+/// Parquet rows are classified like NDJSON lines. Only the line-per-record
+/// producers are accepted: the other parsers read gzip streams.
+fn detect_parquet(path: &Path) -> Detection {
+    let head = match parquet_head(path) {
+        Ok(head) => head,
+        Err(note) => return Detection::unknown(path, note),
+    };
+    let text = String::from_utf8_lossy(&head);
+    let Some((log_type, value)) = text
+        .lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|value| crate::ndjson::classify(&value).map(|t| (t, value)))
+    else {
+        return Detection::unknown(path, "no recognized log signature in parquet rows");
+    };
+    Detection {
+        path: path.to_path_buf(),
+        log_type,
+        confidence: Confidence::High,
+        sample: Some(crate::ndjson::sample(log_type, &value)),
+        // The footer holds the exact count; no extrapolation needed.
+        record_count_estimate: crate::parquet::row_count(path).ok(),
+        estimated: false,
+        decoded_bytes: head.len(),
+        members_in_head: 0,
+        note: None,
     }
 }
 
@@ -165,12 +220,17 @@ pub fn detect_file(path: &Path) -> Result<Detection, DetectError> {
         })?
         .len();
 
-    let mut reader = BufReader::new(file);
-    let mut magic = [0u8; 2];
-    match reader.read_exact(&mut magic) {
-        Ok(()) if magic == GZIP_MAGIC => {}
-        Ok(()) => return Ok(Detection::unknown(path, "not gzip: bad magic bytes")),
-        Err(_) => return Ok(Detection::unknown(path, "not gzip: file too short")),
+    let mut magic = Vec::with_capacity(4);
+    if let Err(source) = file.take(4).read_to_end(&mut magic) {
+        return Ok(Detection::unknown(path, format!("cannot read: {source}")));
+    }
+    if crate::parquet::has_magic(&magic) {
+        return Ok(detect_parquet(path));
+    }
+    match magic.get(..2) {
+        Some(prefix) if prefix == GZIP_MAGIC => {}
+        Some(_) => return Ok(Detection::unknown(path, "not gzip: bad magic bytes")),
+        None => return Ok(Detection::unknown(path, "not gzip: file too short")),
     }
 
     let (head, truncated_stream) = match decoded_head(path) {

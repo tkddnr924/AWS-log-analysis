@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   commands,
   type EventCursor,
@@ -266,6 +267,43 @@ export function Results({ caseId }: { caseId: string }) {
           pageWindow(after, source.search, newestFirst),
         );
   };
+
+  // JSONL export of the whole list on screen, loaded or not. It waits for
+  // the same settled list 통계 counts: a half-resolved search or a rule still
+  // being written would export a scope the table does not show.
+  const [exporting, setExporting] = useState(false);
+  const [exportNote, setExportNote] = useState<string | null>(null);
+  const exportList = async () => {
+    if (!statsList || exporting) return;
+    const name = [caseId, logType, statsList.ruleId ?? "all-events"]
+      .filter(Boolean)
+      .join("-")
+      .replace(/[^\w.-]+/g, "_");
+    const path = await save({
+      defaultPath: `${name}.jsonl`,
+      filters: [{ name: "JSON Lines", extensions: ["jsonl"] }],
+    });
+    if (!path || !mounted.current) return;
+    setExporting(true);
+    setExportNote("내보내는 중…");
+    const r = await commands.exportResults(
+      caseId,
+      statsList.ruleId,
+      pageWindow(null, statsList.search, newestFirst),
+      path,
+    );
+    if (!mounted.current) return;
+    setExporting(false);
+    setExportNote(
+      r.status === "ok"
+        ? `${r.data.toLocaleString()}건 내보냄`
+        : `내보내기 실패: ${r.error}`,
+    );
+  };
+  // A note about the previous list must not describe the next one.
+  useEffect(() => {
+    setExportNote(null);
+  }, [selected, search, newestFirst, logType, from, to]);
 
   // Which rules exist and what they say; a save or delete changes both.
   useEffect(() => {
@@ -612,6 +650,9 @@ export function Results({ caseId }: { caseId: string }) {
           onToggleSort={() => setNewestFirst((v) => !v)}
           onStats={() => setStatsOpen(true)}
           statsReady={statsList !== null}
+          onExport={() => void exportList()}
+          exportReady={statsList !== null && !exporting}
+          exportNote={exportNote}
           // A new list under the same scrollbar: the old offset would land on
           // an unrelated row, or past the end of a shorter filtered list.
           viewKey={`${selected}\u0000${search}\u0000${newestFirst}\u0000${logType}\u0000${from}\u0000${to}`}
@@ -814,6 +855,7 @@ function layoutFor(tab: string | null): Layout {
     case "alb_access":
     case "apigw_access":
     case "nginx_access":
+    case "gateway_request":
       return "http";
     case "waf_acl":
       return "waf";
@@ -912,6 +954,9 @@ function MatchList({
   onToggleSort,
   onStats,
   statsReady,
+  onExport,
+  exportReady,
+  exportNote,
   viewKey,
   evaluating,
   loading,
@@ -939,6 +984,11 @@ function MatchList({
   onStats: () => void;
   /// The list's filter has resolved; until then there is nothing to count.
   statsReady: boolean;
+  /// Writes the whole list, not only the loaded rows, to a `.jsonl` file.
+  onExport: () => void;
+  exportReady: boolean;
+  /// Progress or outcome of the last export of this list.
+  exportNote: string | null;
   /// Changes whenever the rows underneath are a different list.
   viewKey: string;
   /// The selected rule is being run over the case; the rows are on the way.
@@ -1017,6 +1067,23 @@ function MatchList({
         >
           통계
         </button>
+        <button
+          className="sort-toggle"
+          onClick={onExport}
+          disabled={!exportReady}
+          title={
+            exportReady
+              ? "목록 전체(더 불러오지 않은 행 포함)를 JSONL 파일로 저장"
+              : "검색이 끝난 뒤에 내보낼 수 있습니다"
+          }
+        >
+          JSONL 내보내기
+        </button>
+        {exportNote && (
+          <span className="search-note" role="status" aria-live="polite">
+            {exportNote}
+          </span>
+        )}
       </div>
       <div className={`match-cols cols-${layout}`} role="presentation">
         {layout === "http" ? (

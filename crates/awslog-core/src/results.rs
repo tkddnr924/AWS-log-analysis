@@ -320,6 +320,18 @@ pub fn field_stats(
     store.field_stats(rule_id, field, window)
 }
 
+/// Writes the list the window shows — every event (`rule_id` `None`), or the
+/// matches of a rule or of [`SEARCH_RULE_ID`] — to `path` as JSON lines.
+/// Every row is written, not just the loaded pages; returns how many.
+pub fn export_jsonl(
+    store: &Store,
+    rule_id: Option<&str>,
+    window: &Window,
+    path: &std::path::Path,
+) -> Result<u64, StoreError> {
+    store.export_jsonl(rule_id, window, path)
+}
+
 /// The rule id condition-search hits are stored under. `#` cannot start a
 /// rule identifier, so no rule shares it, and it is never registered in
 /// `rules`: the sidebar does not list it and case totals leave it out.

@@ -1,4 +1,4 @@
-//! FR-2: collect supported gzip candidates without reading their contents.
+//! FR-2: collect supported gzip and Parquet candidates without reading their contents.
 //! Content is not read here — detection happens in `detect`.
 
 use std::io;
@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
-/// Any gzip file is a candidate: exports arrive as `.json.gz`, `.log.gz`,
-/// `.ndjson.gz` and occasionally a bare `.GZ`. What it holds is decided by
-/// content in `detect`, never by the name.
-const CANDIDATE_SUFFIX: &str = ".gz";
+/// Any gzip or Parquet file is a candidate: exports arrive as `.json.gz`,
+/// `.log.gz`, `.ndjson.gz`, occasionally a bare `.GZ`, or `.parquet`. What
+/// it holds is decided by content in `detect`, never by the name.
+const CANDIDATE_SUFFIXES: [&str; 2] = [".gz", ".parquet"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
@@ -23,7 +23,7 @@ pub enum ScanError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
-    /// Not a supported gzip log filename.
+    /// Not a supported gzip or Parquet log filename.
     Extension,
     /// Zero bytes; nothing to decode.
     Empty,
@@ -137,7 +137,8 @@ fn is_os_metadata(path: &Path) -> bool {
 }
 
 fn is_candidate_name(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.to_ascii_lowercase().ends_with(CANDIDATE_SUFFIX))
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+        let lower = n.to_ascii_lowercase();
+        CANDIDATE_SUFFIXES.iter().any(|s| lower.ends_with(s))
+    })
 }

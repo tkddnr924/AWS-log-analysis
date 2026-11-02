@@ -8,7 +8,8 @@ rust-version.workspace = true
 # `json`: the JSON column type and json_extract_string live in DuckDB's json
 # extension. Linking it in stops DuckDB from downloading it into ~/.duckdb on
 # first use, which fails offline and writes outside cases/ (docs/07).
-duckdb = { version = "1.4.0", features = ["bundled", "json"] }
+# `parquet`: read_parquet for Parquet log exports, linked in for the same reason.
+duckdb = { version = "1.4.0", features = ["bundled", "json", "parquet"] }
 flate2 = "1.1.10"
 rayon = "1.12.0"
 regex = "1.13.1"

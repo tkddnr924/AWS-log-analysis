@@ -16,6 +16,7 @@ export const PARSEABLE_LOG_TYPES = [
   "waf_acl",
   "apigw_access",
   "nginx_access",
+  "gateway_request",
 ] as const;
 
 export function isParseableLogType(logType: string) {
@@ -35,6 +36,8 @@ export function logTypeLabel(logType: string) {
       return "API Gateway";
     case "nginx_access":
       return "nginx";
+    case "gateway_request":
+      return "Gateway";
     case "cloudtrail_digest":
       return "Digest";
     case "config_snapshot":
